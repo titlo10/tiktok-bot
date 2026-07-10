@@ -1123,6 +1123,18 @@ def convert_comment_media(data: bytes, target: str) -> bytes:
     return converted
 
 
+def convert_comment_animation(data: bytes, source_format: str) -> bytes:
+    converted = subprocess.run(
+        ["convert", f"{source_format}:-", "-coalesce", "gif:-"],
+        input=data,
+        check=True,
+        capture_output=True,
+    ).stdout
+    if len(converted) > MAX_COMMENT_IMAGE_BYTES:
+        raise RuntimeError("Converted comment animation exceeds the size limit")
+    return converted
+
+
 def classify_comment_media(data: bytes, content_type: str) -> DownloadedCommentMedia:
     normalized_type = content_type.casefold()
     if data.startswith((b"GIF87a", b"GIF89a")) or normalized_type == "image/gif":
@@ -1148,12 +1160,12 @@ def classify_comment_media(data: bytes, content_type: str) -> DownloadedCommentM
         )
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         if b"acTL" in data:
-            converted = convert_comment_media(data, "mp4")
+            converted = convert_comment_animation(data, "png")
             return DownloadedCommentMedia(
-                content_type="video/mp4",
+                content_type="image/gif",
                 data=converted,
                 kind=RichCommentMediaKind.ANIMATION,
-                suffix=".mp4",
+                suffix=".gif",
             )
         return DownloadedCommentMedia(
             content_type="image/png",
@@ -1162,12 +1174,12 @@ def classify_comment_media(data: bytes, content_type: str) -> DownloadedCommentM
             suffix=".png",
         )
     if data.startswith(b"RIFF") and data[8:12] == b"WEBP" and b"ANIM" in data:
-        converted = convert_comment_media(data, "mp4")
+        converted = convert_comment_animation(data, "webp")
         return DownloadedCommentMedia(
-            content_type="video/mp4",
+            content_type="image/gif",
             data=converted,
             kind=RichCommentMediaKind.ANIMATION,
-            suffix=".mp4",
+            suffix=".gif",
         )
     converted = convert_comment_media(data, "jpeg")
     return DownloadedCommentMedia(

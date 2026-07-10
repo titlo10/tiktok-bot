@@ -215,20 +215,20 @@ def test_classify_comment_media_preserves_supported_formats() -> None:
 
 def test_classify_comment_media_converts_animated_webp(monkeypatch) -> None:
     source = b"RIFF\x10\x00\x00\x00WEBPVP8XANIM"
-    converted = b"\x00\x00\x00\x18ftypisom"
+    converted = b"GIF89aconverted"
     calls: list[tuple[bytes, str]] = []
     monkeypatch.setattr(
         liked_bot,
-        "convert_comment_media",
+        "convert_comment_animation",
         lambda data, target: calls.append((data, target)) or converted,
     )
 
     media = liked_bot.classify_comment_media(source, "image/webp")
 
-    assert calls == [(source, "mp4")]
+    assert calls == [(source, "webp")]
     assert media.data == converted
     assert media.kind == liked_bot.RichCommentMediaKind.ANIMATION
-    assert media.suffix == ".mp4"
+    assert media.suffix == ".gif"
 
 
 def test_rich_message_uses_video_tag_for_animation() -> None:
