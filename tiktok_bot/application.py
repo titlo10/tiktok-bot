@@ -455,7 +455,7 @@ def send_video(path: Path, reply_to_message_id: int | None = None) -> int:
         if reply_to_message_id is not None:
             data["reply_parameters"] = json.dumps({"message_id": reply_to_message_id})
         if TELEGRAM_LOCAL_MODE:
-            data["video"] = str(upload_path.resolve())
+            data["video"] = upload_path.resolve().as_uri()
             result = telegram_call(TelegramMethod.SEND_VIDEO, data)
             return int(result["message_id"])
         with upload_path.open("rb") as video_file:

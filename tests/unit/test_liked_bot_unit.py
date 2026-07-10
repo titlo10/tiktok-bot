@@ -32,6 +32,33 @@ def test_extract_tiktok_video_id_from_url_supports_canonical_and_query_urls() ->
     )
 
 
+def test_send_video_uses_file_uri_in_local_mode(monkeypatch, tmp_path) -> None:
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+    calls: list[tuple[liked_bot.TelegramMethod, liked_bot.JsonObject]] = []
+    monkeypatch.setattr(liked_bot, "TELEGRAM_LOCAL_MODE", True)
+    monkeypatch.setattr(liked_bot, "telegram_chat_data", lambda: {"chat_id": "123"})
+    monkeypatch.setattr(
+        liked_bot,
+        "telegram_call",
+        lambda method, data: calls.append((method, data)) or {"message_id": 99},
+    )
+
+    message_id = liked_bot.send_video(video)
+
+    assert message_id == 99
+    assert calls == [
+        (
+            liked_bot.TelegramMethod.SEND_VIDEO,
+            {
+                "chat_id": "123",
+                "supports_streaming": "true",
+                "video": video.resolve().as_uri(),
+            },
+        )
+    ]
+
+
 def test_handle_tiktok_link_message_delivers_for_configured_chat(monkeypatch) -> None:
     calls: list[tuple] = []
     monkeypatch.setattr(liked_bot.settings, "TELEGRAM_CHAT_ID", "123")
