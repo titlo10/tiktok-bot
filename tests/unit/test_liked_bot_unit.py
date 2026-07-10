@@ -297,6 +297,41 @@ def test_publish_rich_media_reuses_identical_content(monkeypatch, tmp_path) -> N
     assert not comments[1].get("image_publish_failed")
 
 
+def test_media_limit_does_not_report_publish_failure(monkeypatch, tmp_path) -> None:
+    source = b"GIF89a-content"
+    published_path = tmp_path / "comment.gif"
+    published_path.write_bytes(source)
+    monkeypatch.setattr(liked_bot, "MAX_COMMENT_IMAGES", 1)
+    monkeypatch.setattr(liked_bot, "RICH_MEDIA_DIR", tmp_path)
+    monkeypatch.setattr(liked_bot, "RICH_MEDIA_PUBLIC_BASE_URL", "https://example.test")
+    monkeypatch.setattr(
+        liked_bot,
+        "download_comment_media_bytes",
+        lambda url: (source + url.encode(), "image/gif"),
+    )
+    monkeypatch.setattr(
+        liked_bot,
+        "publish_rich_bytes",
+        lambda *_args: liked_bot.PublishedRichMedia(
+            url="https://example.test/comment.gif",
+            path=published_path,
+        ),
+    )
+    monkeypatch.setattr(liked_bot, "rich_image_is_publicly_available", lambda _media: True)
+
+    comments = liked_bot.publish_rich_comment_media(
+        [
+            {"image_url_candidates": [["https://one.test/a"]]},
+            {"image_url_candidates": [["https://two.test/b"]]},
+        ],
+        "765",
+    )
+
+    assert len(comments[0]["rich_media"]) == 1
+    assert comments[1]["rich_media"] == []
+    assert not comments[1].get("image_publish_failed")
+
+
 def test_run_cycle_does_not_scan_likes(monkeypatch) -> None:
     monkeypatch.setattr(
         liked_bot,

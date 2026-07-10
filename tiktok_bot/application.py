@@ -1240,14 +1240,11 @@ def publish_rich_comment_media(comments: list[TikTokComment], video_id: str) -> 
         published_comment = dict(comment)
         published_media: list[RichCommentMedia] = []
         duplicate_media = False
+        media_limit_reached = False
         image_url_groups = comment.get("image_url_candidates") or [
             [url] for url in comment.get("image_urls") or []
         ]
         for candidates in image_url_groups:
-            if image_index >= MAX_COMMENT_IMAGES:
-                break
-
-            image_index += 1
             last_error = None
             for url in candidates:
                 if not is_http_url(url):
@@ -1270,7 +1267,11 @@ def publish_rich_comment_media(comments: list[TikTokComment], video_id: str) -> 
                             published_media.append(cached_media)
                             embedded_urls.add(cached_media["url"])
                         break
+                    if len(embedded_urls) >= MAX_COMMENT_IMAGES:
+                        media_limit_reached = True
+                        break
                     media = classify_comment_media(data, content_type)
+                    image_index += 1
                     content = io.BytesIO(media.data)
                     try:
                         published = publish_rich_bytes(
@@ -1318,7 +1319,12 @@ def publish_rich_comment_media(comments: list[TikTokComment], video_id: str) -> 
             media["url"] for media in published_media if media["kind"] == RichCommentMediaKind.PHOTO
         ]
         published_comment["rich_media"] = published_media
-        if image_url_groups and not published_media and not duplicate_media:
+        if (
+            image_url_groups
+            and not published_media
+            and not duplicate_media
+            and not media_limit_reached
+        ):
             published_comment["image_publish_failed"] = True
         published_comments.append(published_comment)
 
