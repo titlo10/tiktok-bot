@@ -254,6 +254,47 @@ def test_rich_message_uses_video_tag_for_animation() -> None:
     assert "<img" not in html
 
 
+def test_publish_rich_media_reuses_identical_content(monkeypatch, tmp_path) -> None:
+    source = b"GIF89a-content"
+    published_path = tmp_path / "comment.gif"
+    published_path.write_bytes(source)
+    classifications: list[bytes] = []
+    original_classifier = liked_bot.classify_comment_media
+    monkeypatch.setattr(liked_bot, "RICH_MEDIA_DIR", tmp_path)
+    monkeypatch.setattr(liked_bot, "RICH_MEDIA_PUBLIC_BASE_URL", "https://example.test")
+    monkeypatch.setattr(
+        liked_bot,
+        "download_comment_media_bytes",
+        lambda _url: (source, "image/gif"),
+    )
+    monkeypatch.setattr(
+        liked_bot,
+        "classify_comment_media",
+        lambda data, content_type: classifications.append(data)
+        or original_classifier(data, content_type),
+    )
+    monkeypatch.setattr(
+        liked_bot,
+        "publish_rich_bytes",
+        lambda *_args: liked_bot.PublishedRichMedia(
+            url="https://example.test/comment.gif",
+            path=published_path,
+        ),
+    )
+    monkeypatch.setattr(liked_bot, "rich_image_is_publicly_available", lambda _media: True)
+
+    comments = liked_bot.publish_rich_comment_media(
+        [
+            {"image_url_candidates": [["https://one.test/a"]]},
+            {"image_url_candidates": [["https://two.test/b"]]},
+        ],
+        "765",
+    )
+
+    assert classifications == [source]
+    assert comments[0]["rich_media"] == comments[1]["rich_media"]
+
+
 def test_run_cycle_does_not_scan_likes(monkeypatch) -> None:
     monkeypatch.setattr(
         liked_bot,

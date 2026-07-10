@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.cookiejar
 import io
 import json
@@ -1190,7 +1191,7 @@ def classify_comment_media(data: bytes, content_type: str) -> DownloadedCommentM
     )
 
 
-def download_comment_media(url: str) -> DownloadedCommentMedia:
+def download_comment_media_bytes(url: str) -> tuple[bytes, str]:
     with requests.get(
         url,
         headers={"User-Agent": TIKTOK_WEB_USER_AGENT},
@@ -1207,7 +1208,12 @@ def download_comment_media(url: str) -> DownloadedCommentMedia:
             if content.tell() > MAX_COMMENT_IMAGE_BYTES:
                 raise RuntimeError("TikTok comment image exceeds the 10 MB limit")
         content_type = response.headers.get("content-type", "image/jpeg").split(";", 1)[0]
-    return classify_comment_media(content.getvalue(), content_type)
+    return content.getvalue(), content_type
+
+
+def download_comment_media(url: str) -> DownloadedCommentMedia:
+    data, content_type = download_comment_media_bytes(url)
+    return classify_comment_media(data, content_type)
 
 
 def download_comment_image(url: str, index: int) -> tuple[str, io.BytesIO, str]:
@@ -1227,6 +1233,8 @@ def publish_rich_comment_media(comments: list[TikTokComment], video_id: str) -> 
 
     published_comments = []
     image_index = 0
+    published_by_url: dict[str, RichCommentMedia] = {}
+    published_by_digest: dict[str, RichCommentMedia] = {}
     for comment in comments:
         published_comment = dict(comment)
         published_media: list[RichCommentMedia] = []
@@ -1242,8 +1250,17 @@ def publish_rich_comment_media(comments: list[TikTokComment], video_id: str) -> 
             for url in candidates:
                 if not is_http_url(url):
                     continue
+                if cached_media := published_by_url.get(url):
+                    published_media.append(cached_media)
+                    break
                 try:
-                    media = download_comment_media(url)
+                    data, content_type = download_comment_media_bytes(url)
+                    digest = hashlib.sha256(data).hexdigest()
+                    if cached_media := published_by_digest.get(digest):
+                        published_by_url[url] = cached_media
+                        published_media.append(cached_media)
+                        break
+                    media = classify_comment_media(data, content_type)
                     content = io.BytesIO(media.data)
                     try:
                         published = publish_rich_bytes(
@@ -1261,7 +1278,13 @@ def publish_rich_comment_media(comments: list[TikTokComment], video_id: str) -> 
 
                 if published:
                     if rich_image_is_publicly_available(published):
-                        published_media.append({"kind": media.kind, "url": published.url})
+                        rich_media: RichCommentMedia = {
+                            "kind": media.kind,
+                            "url": published.url,
+                        }
+                        published_by_url[url] = rich_media
+                        published_by_digest[digest] = rich_media
+                        published_media.append(rich_media)
                         break
                     try:
                         published.path.unlink(missing_ok=True)
