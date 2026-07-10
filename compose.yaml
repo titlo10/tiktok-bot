@@ -1,0 +1,8 @@
+services:
+  atp:
+    image: skrepkaq/atp
+    container_name: atp
+    volumes:
+      - ./config:/config
+      - ./downloads:/downloads
+    restart: unless-stopped

@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v8
+      - uses: actions/setup-python@v6
+        with:
+          python-version-file: pyproject.toml
+      - run: uv sync --frozen --group dev
+      - run: uv run ruff check .
+      - run: uv run pytest --cov=atp --cov=tiktok_bot --cov-report=term-missing
+      - run: ./scripts/check_repository.sh

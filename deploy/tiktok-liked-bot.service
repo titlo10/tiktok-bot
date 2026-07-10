@@ -1,0 +1,27 @@
+[Unit]
+Description=TikTok link Telegram bot
+Wants=network-online.target nginx.service
+After=network-online.target nginx.service telegram-bot-api.service
+Requires=telegram-bot-api.service
+
+[Service]
+Type=simple
+User=tiktokbot
+Group=tiktokbot
+WorkingDirectory=/opt/tiktok-bot/current
+ExecStart=/opt/tiktok-bot/current/.venv/bin/python -m tiktok_bot
+Restart=always
+RestartSec=15
+TimeoutStopSec=30
+Environment=PYTHONUNBUFFERED=1
+Environment=TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
+Environment=TELEGRAM_LOCAL_MODE=true
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/tiktok-bot/shared /var/www/tiktok-rich
+
+[Install]
+WantedBy=multi-user.target

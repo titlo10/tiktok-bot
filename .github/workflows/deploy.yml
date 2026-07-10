@@ -1,0 +1,51 @@
+name: Deploy
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - name: Configure SSH
+        env:
+          DEPLOY_KEY: ${{ secrets.BER_DEPLOY_KEY }}
+          DEPLOY_HOST: ${{ vars.BER_HOST }}
+        run: |
+          install -d -m 700 ~/.ssh
+          install -m 600 /dev/null ~/.ssh/id_ed25519
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          ssh-keyscan -H "$DEPLOY_HOST" > ~/.ssh/known_hosts
+      - name: Package release
+        env:
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: tar -czf "/tmp/tiktok-bot-${RELEASE_SHA}.tar.gz" --exclude=.git --exclude=.venv .
+      - name: Upload release
+        env:
+          DEPLOY_HOST: ${{ vars.BER_HOST }}
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: scp "/tmp/tiktok-bot-${RELEASE_SHA}.tar.gz" "deployer@${DEPLOY_HOST}:/tmp/tiktok-bot-${RELEASE_SHA}.tar.gz"
+      - name: Activate release
+        env:
+          DEPLOY_HOST: ${{ vars.BER_HOST }}
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: ssh "deployer@${DEPLOY_HOST}" sudo /usr/local/sbin/deploy-tiktok-bot "$RELEASE_SHA" "/tmp/tiktok-bot-${RELEASE_SHA}.tar.gz"

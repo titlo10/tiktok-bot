@@ -1,0 +1,26 @@
+#!/bin/sh
+set -eu
+
+release_sha=$1
+archive=$2
+root=/opt/tiktok-bot
+release="$root/releases/$release_sha"
+case "$release_sha" in
+    *[!0-9a-f]*|'') exit 2 ;;
+esac
+
+test -f "$archive"
+test ! -e "$release"
+install -d -o tiktokbot -g tiktokbot -m 750 "$release" "$root/releases" "$root/shared/config" "$root/shared/downloads"
+tar -xzf "$archive" -C "$release"
+ln -s "$root/shared/config" "$release/config"
+ln -s "$root/shared/downloads" "$release/downloads"
+chown -R tiktokbot:tiktokbot "$release"
+cd "$release"
+runuser -u tiktokbot -- /usr/local/bin/uv sync --frozen --no-dev
+ln -sfn "$release" "$root/current.next"
+mv -Tf "$root/current.next" "$root/current"
+systemctl restart tiktok-liked-bot.service
+systemctl is-active --quiet tiktok-liked-bot.service
+find "$root/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -nr | tail -n +4 | cut -d' ' -f2- | xargs -r rm -rf
+rm -f "$archive"
