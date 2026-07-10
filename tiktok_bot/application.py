@@ -1235,9 +1235,11 @@ def publish_rich_comment_media(comments: list[TikTokComment], video_id: str) -> 
     image_index = 0
     published_by_url: dict[str, RichCommentMedia] = {}
     published_by_digest: dict[str, RichCommentMedia] = {}
+    embedded_urls: set[str] = set()
     for comment in comments:
         published_comment = dict(comment)
         published_media: list[RichCommentMedia] = []
+        duplicate_media = False
         image_url_groups = comment.get("image_url_candidates") or [
             [url] for url in comment.get("image_urls") or []
         ]
@@ -1251,14 +1253,22 @@ def publish_rich_comment_media(comments: list[TikTokComment], video_id: str) -> 
                 if not is_http_url(url):
                     continue
                 if cached_media := published_by_url.get(url):
-                    published_media.append(cached_media)
+                    if cached_media["url"] in embedded_urls:
+                        duplicate_media = True
+                    else:
+                        published_media.append(cached_media)
+                        embedded_urls.add(cached_media["url"])
                     break
                 try:
                     data, content_type = download_comment_media_bytes(url)
                     digest = hashlib.sha256(data).hexdigest()
                     if cached_media := published_by_digest.get(digest):
                         published_by_url[url] = cached_media
-                        published_media.append(cached_media)
+                        if cached_media["url"] in embedded_urls:
+                            duplicate_media = True
+                        else:
+                            published_media.append(cached_media)
+                            embedded_urls.add(cached_media["url"])
                         break
                     media = classify_comment_media(data, content_type)
                     content = io.BytesIO(media.data)
@@ -1285,6 +1295,7 @@ def publish_rich_comment_media(comments: list[TikTokComment], video_id: str) -> 
                         published_by_url[url] = rich_media
                         published_by_digest[digest] = rich_media
                         published_media.append(rich_media)
+                        embedded_urls.add(rich_media["url"])
                         break
                     try:
                         published.path.unlink(missing_ok=True)
@@ -1307,7 +1318,7 @@ def publish_rich_comment_media(comments: list[TikTokComment], video_id: str) -> 
             media["url"] for media in published_media if media["kind"] == RichCommentMediaKind.PHOTO
         ]
         published_comment["rich_media"] = published_media
-        if image_url_groups and not published_media:
+        if image_url_groups and not published_media and not duplicate_media:
             published_comment["image_publish_failed"] = True
         published_comments.append(published_comment)
 

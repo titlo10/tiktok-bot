@@ -292,7 +292,9 @@ def test_publish_rich_media_reuses_identical_content(monkeypatch, tmp_path) -> N
     )
 
     assert classifications == [source]
-    assert comments[0]["rich_media"] == comments[1]["rich_media"]
+    assert len(comments[0]["rich_media"]) == 1
+    assert comments[1]["rich_media"] == []
+    assert not comments[1].get("image_publish_failed")
 
 
 def test_run_cycle_does_not_scan_likes(monkeypatch) -> None:
