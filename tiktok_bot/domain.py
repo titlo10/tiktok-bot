@@ -31,6 +31,11 @@ class DeliveryStatus(StrEnum):
     SKIPPED = "skipped"
 
 
+class RichCommentMediaKind(StrEnum):
+    ANIMATION = "animation"
+    PHOTO = "photo"
+
+
 JsonObject = dict[str, Any]
 
 
@@ -57,8 +62,22 @@ class TikTokComment(TypedDict, total=False):
     image_url_candidates: list[list[str]]
     image_urls: list[str]
     likes: int
+    rich_media: list["RichCommentMedia"]
     text: str
     username: str
+
+
+class RichCommentMedia(TypedDict):
+    kind: RichCommentMediaKind
+    url: str
+
+
+@dataclass
+class DownloadedCommentMedia:
+    content_type: str
+    data: bytes
+    kind: RichCommentMediaKind
+    suffix: str
 
 
 @dataclass

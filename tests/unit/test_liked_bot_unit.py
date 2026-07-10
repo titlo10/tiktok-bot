@@ -194,6 +194,66 @@ def test_rich_message_contains_only_comment_content(monkeypatch) -> None:
     assert data["reply_parameters"] == '{"message_id": 77}'
 
 
+def test_classify_comment_media_preserves_supported_formats() -> None:
+    gif = b"GIF89a" + b"content"
+    jpeg = b"\xff\xd8\xff" + b"content"
+    png = b"\x89PNG\r\n\x1a\n" + b"content"
+    mp4 = b"\x00\x00\x00\x18ftypisom" + b"content"
+
+    cases = [
+        (gif, "image/gif", liked_bot.RichCommentMediaKind.ANIMATION, ".gif"),
+        (jpeg, "image/jpeg", liked_bot.RichCommentMediaKind.PHOTO, ".jpg"),
+        (png, "image/png", liked_bot.RichCommentMediaKind.PHOTO, ".png"),
+        (mp4, "video/mp4", liked_bot.RichCommentMediaKind.ANIMATION, ".mp4"),
+    ]
+    for data, content_type, kind, suffix in cases:
+        media = liked_bot.classify_comment_media(data, content_type)
+        assert media.data == data
+        assert media.kind == kind
+        assert media.suffix == suffix
+
+
+def test_classify_comment_media_converts_animated_webp(monkeypatch) -> None:
+    source = b"RIFF\x10\x00\x00\x00WEBPVP8XANIM"
+    converted = b"\x00\x00\x00\x18ftypisom"
+    calls: list[tuple[bytes, str]] = []
+    monkeypatch.setattr(
+        liked_bot,
+        "convert_comment_media",
+        lambda data, target: calls.append((data, target)) or converted,
+    )
+
+    media = liked_bot.classify_comment_media(source, "image/webp")
+
+    assert calls == [(source, "mp4")]
+    assert media.data == converted
+    assert media.kind == liked_bot.RichCommentMediaKind.ANIMATION
+    assert media.suffix == ".mp4"
+
+
+def test_rich_message_uses_video_tag_for_animation() -> None:
+    html = liked_bot.build_rich_message_html(
+        "765",
+        0,
+        liked_bot.RichMediaSource(),
+        [
+            {
+                "username": "alice",
+                "text": "animation",
+                "rich_media": [
+                    {
+                        "kind": liked_bot.RichCommentMediaKind.ANIMATION,
+                        "url": "https://example.test/sticker.gif",
+                    }
+                ],
+            }
+        ],
+    )
+
+    assert '<video src="https://example.test/sticker.gif"></video>' in html
+    assert "<img" not in html
+
+
 def test_run_cycle_does_not_scan_likes(monkeypatch) -> None:
     monkeypatch.setattr(
         liked_bot,

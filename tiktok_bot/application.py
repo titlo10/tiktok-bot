@@ -57,9 +57,12 @@ from atp.tiktok import download_video, get_user_liked_videos, yt_dlp_request
 from tiktok_bot.domain import (
     DeliveredTikTokVideo,
     DeliveryStatus,
+    DownloadedCommentMedia,
     JsonObject,
     PublishedRichMedia,
     RichMediaSource,
+    RichCommentMedia,
+    RichCommentMediaKind,
     TelegramAPIError,
     TelegramMethod,
     TelegramMessage,
@@ -540,7 +543,8 @@ def rich_image_is_publicly_available(published: PublishedRichMedia) -> bool:
                 published.url,
             )
             return False
-        if not response.headers.get("content-type", "").lower().startswith("image/"):
+        public_content_type = response.headers.get("content-type", "").lower()
+        if not public_content_type.startswith(("image/", "video/")):
             logger.warning(
                 "Published comment image has unexpected content type %r: %s",
                 response.headers.get("content-type"),
@@ -779,14 +783,20 @@ def comment_details_html(comments: list[TikTokComment]) -> str:
         elif comment.get("image_publish_failed"):
             blocks.append("<p>Изображение не удалось встроить.</p>")
 
-        for image_url in comment.get("image_urls") or []:
+        rich_media = comment.get("rich_media") or [
+            {"kind": RichCommentMediaKind.PHOTO, "url": url}
+            for url in comment.get("image_urls") or []
+        ]
+        for media in rich_media:
             if embedded_images >= MAX_COMMENT_IMAGES:
                 break
-            if not is_http_url(image_url):
+            media_url = media["url"]
+            if not is_http_url(media_url):
                 continue
             embedded_images += 1
-            escaped_url = escape(str(image_url), quote=True)
-            blocks.append(f'<figure><img src="{escaped_url}"></figure>')
+            escaped_url = escape(media_url, quote=True)
+            tag = "video" if media["kind"] == RichCommentMediaKind.ANIMATION else "img"
+            blocks.append(f'<figure><{tag} src="{escaped_url}"></{tag}></figure>')
 
     blocks.append("</details>")
     return "\n".join(blocks)
@@ -845,6 +855,24 @@ def strip_comment_images(comments: list[TikTokComment]) -> list[TikTokComment]:
         if stripped_comment.get("image_urls"):
             stripped_comment["image_publish_failed"] = True
         stripped_comment["image_urls"] = []
+        stripped_comment["rich_media"] = []
+        stripped.append(stripped_comment)
+    return stripped
+
+
+def strip_comment_media_kind(
+    comments: list[TikTokComment], kind: RichCommentMediaKind
+) -> list[TikTokComment]:
+    stripped: list[TikTokComment] = []
+    for comment in comments:
+        stripped_comment = dict(comment)
+        remaining_media = [
+            media for media in comment.get("rich_media") or [] if media["kind"] != kind
+        ]
+        stripped_comment["rich_media"] = remaining_media
+        stripped_comment["image_urls"] = [
+            media["url"] for media in remaining_media if media["kind"] == RichCommentMediaKind.PHOTO
+        ]
         stripped.append(stripped_comment)
     return stripped
 
@@ -860,6 +888,12 @@ def rich_media_missing_kind(error: Exception) -> str | None:
         return "video"
     if "RICH_MESSAGE_AUDIO_NO_MEDIA_FOUND" in description:
         return "audio"
+    if "RICH_MESSAGE_VIDEO_INVALID" in description:
+        return "animation"
+    if "RICH_MESSAGE_ANIMATION_INVALID" in description:
+        return "animation"
+    if "RICH_MESSAGE_PHOTO_INVALID" in description:
+        return "photo"
     if "RICH_MESSAGE_" in description and "_NO_MEDIA_FOUND" in description:
         return "media"
     return None
@@ -876,7 +910,7 @@ def send_rich_tiktok_message_with_fallbacks(
     rich_source = RichMediaSource()
     rich_comments = comments
     embedded_video = False
-    embedded_comment_images = bool(comment_images(comments))
+    embedded_comment_images = any(comment.get("rich_media") for comment in comments)
 
     while True:
         try:
@@ -893,15 +927,28 @@ def send_rich_tiktok_message_with_fallbacks(
             if not missing_kind:
                 raise
 
-            if missing_kind == "photo" and embedded_comment_images:
-                logger.warning(
-                    "Telegram could not fetch comment media for video %s: %s. "
-                    "Retrying RichMessage without embedded comment images.",
-                    video_id,
-                    exc,
+            if missing_kind == "animation" and any(
+                media["kind"] == RichCommentMediaKind.ANIMATION
+                for comment in rich_comments
+                for media in comment.get("rich_media") or []
+            ):
+                rich_comments = strip_comment_media_kind(
+                    rich_comments, RichCommentMediaKind.ANIMATION
                 )
-                rich_comments = strip_comment_images(rich_comments)
-                embedded_comment_images = False
+                embedded_comment_images = any(
+                    comment.get("rich_media") for comment in rich_comments
+                )
+                continue
+
+            if missing_kind == "photo" and any(
+                media["kind"] == RichCommentMediaKind.PHOTO
+                for comment in rich_comments
+                for media in comment.get("rich_media") or []
+            ):
+                rich_comments = strip_comment_media_kind(rich_comments, RichCommentMediaKind.PHOTO)
+                embedded_comment_images = any(
+                    comment.get("rich_media") for comment in rich_comments
+                )
                 continue
 
             if embedded_comment_images:
@@ -1029,7 +1076,109 @@ def format_top_comments(comments: list[TikTokComment]) -> str:
     return "\n\n".join(blocks)[:4096]
 
 
-def download_comment_image(url: str, index: int) -> tuple[str, io.BytesIO, str]:
+def convert_comment_media(data: bytes, target: str) -> bytes:
+    if target == "jpeg":
+        command = [
+            "ffmpeg",
+            "-loglevel",
+            "error",
+            "-i",
+            "pipe:0",
+            "-frames:v",
+            "1",
+            "-f",
+            "image2pipe",
+            "-c:v",
+            "mjpeg",
+            "pipe:1",
+        ]
+    else:
+        command = [
+            "ffmpeg",
+            "-loglevel",
+            "error",
+            "-i",
+            "pipe:0",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "frag_keyframe+empty_moov",
+            "-f",
+            "mp4",
+            "pipe:1",
+        ]
+    converted = subprocess.run(
+        command,
+        input=data,
+        check=True,
+        capture_output=True,
+    ).stdout
+    if len(converted) > MAX_COMMENT_IMAGE_BYTES:
+        raise RuntimeError("Converted comment media exceeds the size limit")
+    return converted
+
+
+def classify_comment_media(data: bytes, content_type: str) -> DownloadedCommentMedia:
+    normalized_type = content_type.casefold()
+    if data.startswith((b"GIF87a", b"GIF89a")) or normalized_type == "image/gif":
+        return DownloadedCommentMedia(
+            content_type="image/gif",
+            data=data,
+            kind=RichCommentMediaKind.ANIMATION,
+            suffix=".gif",
+        )
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        return DownloadedCommentMedia(
+            content_type="video/mp4",
+            data=data,
+            kind=RichCommentMediaKind.ANIMATION,
+            suffix=".mp4",
+        )
+    if data.startswith(b"\xff\xd8\xff"):
+        return DownloadedCommentMedia(
+            content_type="image/jpeg",
+            data=data,
+            kind=RichCommentMediaKind.PHOTO,
+            suffix=".jpg",
+        )
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        if b"acTL" in data:
+            converted = convert_comment_media(data, "mp4")
+            return DownloadedCommentMedia(
+                content_type="video/mp4",
+                data=converted,
+                kind=RichCommentMediaKind.ANIMATION,
+                suffix=".mp4",
+            )
+        return DownloadedCommentMedia(
+            content_type="image/png",
+            data=data,
+            kind=RichCommentMediaKind.PHOTO,
+            suffix=".png",
+        )
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP" and b"ANIM" in data:
+        converted = convert_comment_media(data, "mp4")
+        return DownloadedCommentMedia(
+            content_type="video/mp4",
+            data=converted,
+            kind=RichCommentMediaKind.ANIMATION,
+            suffix=".mp4",
+        )
+    converted = convert_comment_media(data, "jpeg")
+    return DownloadedCommentMedia(
+        content_type="image/jpeg",
+        data=converted,
+        kind=RichCommentMediaKind.PHOTO,
+        suffix=".jpg",
+    )
+
+
+def download_comment_media(url: str) -> DownloadedCommentMedia:
     with requests.get(
         url,
         headers={"User-Agent": TIKTOK_WEB_USER_AGENT},
@@ -1045,48 +1194,30 @@ def download_comment_image(url: str, index: int) -> tuple[str, io.BytesIO, str]:
             content.write(chunk)
             if content.tell() > MAX_COMMENT_IMAGE_BYTES:
                 raise RuntimeError("TikTok comment image exceeds the 10 MB limit")
-        content.seek(0)
         content_type = response.headers.get("content-type", "image/jpeg").split(";", 1)[0]
-    if content_type != "image/jpeg":
-        converted = subprocess.run(
-            [
-                "ffmpeg",
-                "-loglevel",
-                "error",
-                "-i",
-                "pipe:0",
-                "-frames:v",
-                "1",
-                "-f",
-                "image2pipe",
-                "-c:v",
-                "mjpeg",
-                "pipe:1",
-            ],
-            input=content.getvalue(),
-            check=True,
-            capture_output=True,
-        ).stdout
-        content.close()
-        content = io.BytesIO(converted)
-        content_type = "image/jpeg"
-        if len(converted) > MAX_COMMENT_IMAGE_BYTES:
-            raise RuntimeError("Converted comment image exceeds the 10 MB limit")
-        content.seek(0)
-    return f"comment-{index}.jpg", content, content_type
+    return classify_comment_media(content.getvalue(), content_type)
 
 
-def publish_rich_comment_images(
-    comments: list[TikTokComment], video_id: str
-) -> list[TikTokComment]:
+def download_comment_image(url: str, index: int) -> tuple[str, io.BytesIO, str]:
+    media = download_comment_media(url)
+    data = (
+        convert_comment_media(media.data, "jpeg")
+        if media.kind == RichCommentMediaKind.ANIMATION
+        else media.data
+    )
+    content = io.BytesIO(data)
+    return f"comment-{index}.jpg", content, "image/jpeg"
+
+
+def publish_rich_comment_media(comments: list[TikTokComment], video_id: str) -> list[TikTokComment]:
     if not RICH_MEDIA_DIR or not RICH_MEDIA_PUBLIC_BASE_URL:
-        return comments
+        return strip_comment_images(comments)
 
     published_comments = []
     image_index = 0
     for comment in comments:
         published_comment = dict(comment)
-        published_urls = []
+        published_media: list[RichCommentMedia] = []
         image_url_groups = comment.get("image_url_candidates") or [
             [url] for url in comment.get("image_urls") or []
         ]
@@ -1100,14 +1231,15 @@ def publish_rich_comment_images(
                 if not is_http_url(url):
                     continue
                 try:
-                    _, content, _ = download_comment_image(url, image_index)
+                    media = download_comment_media(url)
+                    content = io.BytesIO(media.data)
                     try:
                         published = publish_rich_bytes(
                             content,
                             video_id,
                             "comment",
                             image_index,
-                            ".jpg",
+                            media.suffix,
                         )
                     finally:
                         content.close()
@@ -1117,7 +1249,7 @@ def publish_rich_comment_images(
 
                 if published:
                     if rich_image_is_publicly_available(published):
-                        published_urls.append(published.url)
+                        published_media.append({"kind": media.kind, "url": published.url})
                         break
                     try:
                         published.path.unlink(missing_ok=True)
@@ -1136,12 +1268,21 @@ def publish_rich_comment_images(
                         last_error,
                     )
 
-        published_comment["image_urls"] = published_urls
-        if image_url_groups and not published_urls:
+        published_comment["image_urls"] = [
+            media["url"] for media in published_media if media["kind"] == RichCommentMediaKind.PHOTO
+        ]
+        published_comment["rich_media"] = published_media
+        if image_url_groups and not published_media:
             published_comment["image_publish_failed"] = True
         published_comments.append(published_comment)
 
     return published_comments
+
+
+def publish_rich_comment_images(
+    comments: list[TikTokComment], video_id: str
+) -> list[TikTokComment]:
+    return publish_rich_comment_media(comments, video_id)
 
 
 def comment_images(comments: list[TikTokComment]) -> list[tuple[int, str]]:
@@ -1351,13 +1492,27 @@ def deliver_tiktok_video(video_id: str, liked_at: int) -> DeliveredTikTokVideo:
             rich_comments = publish_rich_comment_images(comments, video_id)
             embedded_comment_images = False
             if comments:
-                _, _, embedded_comment_images = send_rich_tiktok_message_with_fallbacks(
-                    video_id,
-                    liked_at,
-                    RichMediaSource(),
-                    rich_comments,
-                    video_message_id,
-                )
+                try:
+                    _, _, embedded_comment_images = send_rich_tiktok_message_with_fallbacks(
+                        video_id,
+                        liked_at,
+                        RichMediaSource(),
+                        rich_comments,
+                        video_message_id,
+                    )
+                except TelegramAPIError:
+                    logger.exception(
+                        "RichMessage failed for video %s, sending plain comments",
+                        video_id,
+                    )
+                    telegram_call(
+                        TelegramMethod.SEND_MESSAGE,
+                        {
+                            **telegram_chat_data(),
+                            "text": format_top_comments(comments),
+                            "reply_parameters": json.dumps({"message_id": video_message_id}),
+                        },
+                    )
                 comments_status = DeliveryStatus.SENT
             if original_comment_images:
                 media_status = (

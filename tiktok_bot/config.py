@@ -2,11 +2,17 @@ import os
 import re
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = ROOT / "config"
 load_dotenv(CONFIG_DIR / "secrets.env")
+SETTINGS_VALUES = dotenv_values(CONFIG_DIR / "settings.conf")
+
+
+def config_value(name: str, default: str) -> str:
+    return os.getenv(name) or SETTINGS_VALUES.get(name) or default
+
 
 ENV_ALIASES = {
     "TIKTOK_USERNAME": "TIKTOK_USER",
@@ -41,12 +47,12 @@ MAX_COMMENT_MEDIA_ATTEMPTS = 5
 MAX_COMMENT_IMAGES = 6
 MAX_COMMENT_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_RICH_TEXT_LENGTH = 32_000
-RICH_MEDIA_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
-RICH_MEDIA_PUBLIC_BASE_URL = os.getenv("RICH_MEDIA_PUBLIC_BASE_URL", "").rstrip("/")
-RICH_MEDIA_DIR_RAW = os.getenv("RICH_MEDIA_DIR", "")
+RICH_MEDIA_SUFFIXES = {".gif", ".jpg", ".jpeg", ".mp4", ".png", ".webp"}
+RICH_MEDIA_PUBLIC_BASE_URL = config_value("RICH_MEDIA_PUBLIC_BASE_URL", "").rstrip("/")
+RICH_MEDIA_DIR_RAW = config_value("RICH_MEDIA_DIR", "")
 RICH_MEDIA_DIR = Path(RICH_MEDIA_DIR_RAW).expanduser() if RICH_MEDIA_DIR_RAW else None
-RICH_MEDIA_TTL_SECONDS = max(60, int(os.getenv("RICH_MEDIA_TTL_SECONDS", "900")))
-KEEP_DOWNLOADS = os.getenv("KEEP_DOWNLOADS", "true").lower() in {
+RICH_MEDIA_TTL_SECONDS = max(60, int(config_value("RICH_MEDIA_TTL_SECONDS", "900")))
+KEEP_DOWNLOADS = config_value("KEEP_DOWNLOADS", "true").lower() in {
     "1",
     "true",
     "yes",
