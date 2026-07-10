@@ -14,6 +14,7 @@ Restart=always
 RestartSec=15
 TimeoutStopSec=30
 Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/opt/tiktok-bot/shared
 Environment=TELEGRAM_API_BASE_URL=http://127.0.0.1:8081
 Environment=TELEGRAM_LOCAL_MODE=true
 UMask=0077
