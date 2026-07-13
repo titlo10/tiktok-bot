@@ -36,6 +36,11 @@ class RichCommentMediaKind(StrEnum):
     PHOTO = "photo"
 
 
+class CommentAnimationSourceFormat(StrEnum):
+    PNG = "png"
+    WEBP = "webp"
+
+
 JsonObject = dict[str, Any]
 
 

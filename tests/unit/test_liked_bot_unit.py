@@ -1,4 +1,7 @@
 from contextlib import suppress
+from types import SimpleNamespace
+
+import requests
 
 from tiktok_bot import application as liked_bot
 
@@ -213,22 +216,122 @@ def test_classify_comment_media_preserves_supported_formats() -> None:
         assert media.suffix == suffix
 
 
+def test_classify_comment_media_converts_heic_to_jpeg(monkeypatch) -> None:
+    source = b"\x00\x00\x00\x1cftypheic" + b"content"
+    converted = b"\xff\xd8\xffconverted"
+    calls: list[bytes] = []
+    monkeypatch.setattr(
+        liked_bot,
+        "convert_comment_media_to_jpeg",
+        lambda data: calls.append(data) or converted,
+    )
+
+    media = liked_bot.classify_comment_media(source, "image/heic")
+
+    assert calls == [source]
+    assert media.data == converted
+    assert media.kind == liked_bot.RichCommentMediaKind.PHOTO
+    assert media.suffix == ".jpg"
+
+
 def test_classify_comment_media_converts_animated_webp(monkeypatch) -> None:
     source = b"RIFF\x10\x00\x00\x00WEBPVP8XANIM"
     converted = b"GIF89aconverted"
-    calls: list[tuple[bytes, str]] = []
+    calls: list[tuple[bytes, liked_bot.CommentAnimationSourceFormat]] = []
     monkeypatch.setattr(
         liked_bot,
         "convert_comment_animation",
-        lambda data, target: calls.append((data, target)) or converted,
+        lambda data, source_format: calls.append((data, source_format)) or converted,
     )
 
     media = liked_bot.classify_comment_media(source, "image/webp")
 
-    assert calls == [(source, "webp")]
+    assert calls == [(source, liked_bot.CommentAnimationSourceFormat.WEBP)]
     assert media.data == converted
     assert media.kind == liked_bot.RichCommentMediaKind.ANIMATION
     assert media.suffix == ".gif"
+
+
+def test_classify_comment_media_uses_remote_webp_converter(monkeypatch) -> None:
+    source = b"RIFF\x10\x00\x00\x00WEBPVP8XANIM"
+    converted = b"GIF89aremote"
+    response = requests.Response()
+    response.status_code = 200
+    response._content = converted
+    response.headers["content-type"] = "application/octet-stream"
+    monkeypatch.setattr(liked_bot, "CONVERTAPI_TOKEN", "token", raising=False)
+    monkeypatch.setattr(liked_bot.requests, "post", lambda *_args, **_kwargs: response)
+
+    media = liked_bot.classify_comment_media(source, "image/webp")
+
+    assert media.data == converted
+    assert media.kind == liked_bot.RichCommentMediaKind.ANIMATION
+    assert media.suffix == ".gif"
+
+
+def test_classify_comment_media_falls_back_when_remote_converter_fails(monkeypatch) -> None:
+    source = b"RIFF\x10\x00\x00\x00WEBPVP8XANIM"
+    converted = b"GIF89alocal"
+    response = requests.Response()
+    response.status_code = 500
+    response.url = "https://example.test/convert"
+    monkeypatch.setattr(liked_bot, "CONVERTAPI_TOKEN", "token", raising=False)
+    monkeypatch.setattr(liked_bot.requests, "post", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(
+        liked_bot.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=converted),
+    )
+
+    media = liked_bot.classify_comment_media(source, "image/webp")
+
+    assert media.data == converted
+    assert media.kind == liked_bot.RichCommentMediaKind.ANIMATION
+    assert media.suffix == ".gif"
+
+
+def test_collect_sticker_url_groups_deduplicates_identical_groups() -> None:
+    url = "https://example.test/sticker.webp"
+
+    groups = liked_bot.collect_sticker_url_groups(
+        {
+            "sticker": {
+                "display": {"url_list": [url]},
+                "animated": {"url_list": [url]},
+            }
+        }
+    )
+
+    assert groups == [[url]]
+
+
+def test_fetch_top_comments_keeps_sticker_with_media(monkeypatch) -> None:
+    response = requests.Response()
+    response.status_code = 200
+    response._content = b"""{
+        "status_code": 0,
+        "comments": [{
+            "text": "[sticker]",
+            "digg_count": 7,
+            "create_time": 123,
+            "user": {"unique_id": "alice"},
+            "sticker": {"url_list": ["https://example.test/sticker.webp"]}
+        }]
+    }"""
+    session = requests.Session()
+    monkeypatch.setattr(
+        liked_bot.http.cookiejar.MozillaCookieJar,
+        "load",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(session, "get", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(liked_bot.requests, "Session", lambda: session)
+
+    comments = liked_bot.fetch_top_comments("765")
+
+    assert len(comments) == 1
+    assert comments[0]["text"] == "Стикер"
+    assert comments[0]["image_urls"] == ["https://example.test/sticker.webp"]
 
 
 def test_rich_message_uses_video_tag_for_animation() -> None:

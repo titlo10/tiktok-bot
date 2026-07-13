@@ -21,7 +21,11 @@ from pathlib import Path
 import requests
 
 from tiktok_bot.config import (
+    COMMENT_ANIMATION_MAX_DIMENSION,
     COMMENT_FETCH_LIMIT,
+    CONVERTAPI_TIMEOUT_SECONDS,
+    CONVERTAPI_TOKEN,
+    CONVERTAPI_WEBP_TO_GIF_URL,
     KEEP_DOWNLOADS,
     KNOWN_STREAK_LIMIT,
     MAX_COMMENT_ATTEMPTS,
@@ -56,6 +60,7 @@ from atp import settings
 from atp.models import Video, VideoStatus
 from atp.tiktok import download_video, get_user_liked_videos, yt_dlp_request
 from tiktok_bot.domain import (
+    CommentAnimationSourceFormat,
     DeliveredTikTokVideo,
     DeliveryStatus,
     DownloadedCommentMedia,
@@ -72,6 +77,8 @@ from tiktok_bot.domain import (
 )
 
 logger = logging.getLogger("liked_bot")
+HEIF_CONTENT_TYPES = {"image/heic", "image/heif"}
+HEIF_BRANDS = {b"heic", b"heix", b"hevc", b"hevm", b"mif1", b"msf1"}
 
 
 def normalize_comment_text(text: str) -> str:
@@ -988,6 +995,7 @@ def collect_media_url_groups(media_items: object) -> list[list[str]]:
 
 def collect_sticker_url_groups(item: JsonObject) -> list[list[str]]:
     groups = []
+    seen_groups: set[tuple[str, ...]] = set()
 
     def walk(value: object, in_sticker_context: bool = False) -> None:
         if isinstance(value, dict):
@@ -999,8 +1007,10 @@ def collect_sticker_url_groups(item: JsonObject) -> list[list[str]]:
                     for candidate in nested:
                         if is_http_url(candidate) and candidate not in candidates:
                             candidates.append(candidate)
-                    if candidates:
+                    candidate_group = tuple(candidates)
+                    if candidate_group and candidate_group not in seen_groups:
                         groups.append(candidates)
+                        seen_groups.add(candidate_group)
                 walk(nested, next_context)
         elif isinstance(value, list):
             for nested in value:
@@ -1044,11 +1054,11 @@ def fetch_top_comments(video_id: str) -> list[TikTokComment]:
     comments = []
     for item in payload.get("comments") or []:
         text, has_sticker = strip_sticker_marker(str(item.get("text") or ""))
-        if has_sticker:
-            continue
         image_url_candidates = collect_media_url_groups(item.get("image_list"))
         image_url_candidates.extend(collect_sticker_url_groups(item))
         image_urls = [candidates[0] for candidates in image_url_candidates if candidates]
+        if has_sticker and not image_urls:
+            continue
         if not text and not image_urls:
             continue
         user = item.get("user") or {}
@@ -1077,9 +1087,15 @@ def format_top_comments(comments: list[TikTokComment]) -> str:
     return "\n\n".join(blocks)[:4096]
 
 
-def convert_comment_media(data: bytes, target: str) -> bytes:
-    if target == "jpeg":
-        command = [
+def ensure_comment_media_size(data: bytes) -> bytes:
+    if len(data) > MAX_COMMENT_IMAGE_BYTES:
+        raise RuntimeError("Converted comment media exceeds the size limit")
+    return data
+
+
+def convert_comment_media_to_jpeg(data: bytes) -> bytes:
+    converted = subprocess.run(
+        [
             "ffmpeg",
             "-loglevel",
             "error",
@@ -1092,48 +1108,61 @@ def convert_comment_media(data: bytes, target: str) -> bytes:
             "-c:v",
             "mjpeg",
             "pipe:1",
-        ]
-    else:
-        command = [
-            "ffmpeg",
-            "-loglevel",
-            "error",
-            "-i",
-            "pipe:0",
-            "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "frag_keyframe+empty_moov",
-            "-f",
-            "mp4",
-            "pipe:1",
-        ]
-    converted = subprocess.run(
-        command,
+        ],
         input=data,
         check=True,
         capture_output=True,
     ).stdout
-    if len(converted) > MAX_COMMENT_IMAGE_BYTES:
-        raise RuntimeError("Converted comment media exceeds the size limit")
-    return converted
+    return ensure_comment_media_size(converted)
 
 
-def convert_comment_animation(data: bytes, source_format: str) -> bytes:
+def convert_webp_animation_remotely(data: bytes) -> bytes:
+    response = requests.post(
+        CONVERTAPI_WEBP_TO_GIF_URL,
+        headers={
+            "Authorization": f"Bearer {CONVERTAPI_TOKEN}",
+            "Accept": "application/octet-stream",
+        },
+        data={
+            "StoreFile": "false",
+            "Timeout": str(CONVERTAPI_TIMEOUT_SECONDS),
+            "ImageWidth": str(COMMENT_ANIMATION_MAX_DIMENSION),
+            "ScaleImage": "true",
+            "ScaleProportions": "true",
+        },
+        files={"Files[0]": ("comment.webp", data, "image/webp")},
+        timeout=CONVERTAPI_TIMEOUT_SECONDS + 10,
+    )
+    response.raise_for_status()
+    converted = response.content
+    if not converted.startswith((b"GIF87a", b"GIF89a")):
+        raise RuntimeError("ConvertAPI returned invalid GIF data")
+    return ensure_comment_media_size(converted)
+
+
+def convert_comment_animation(data: bytes, source_format: CommentAnimationSourceFormat) -> bytes:
+    if source_format == CommentAnimationSourceFormat.WEBP and CONVERTAPI_TOKEN:
+        try:
+            return convert_webp_animation_remotely(data)
+        except (requests.RequestException, RuntimeError) as exc:
+            logger.warning("Remote WebP conversion failed, using local fallback: %s", exc)
+
     converted = subprocess.run(
-        ["convert", f"{source_format}:-", "-coalesce", "gif:-"],
+        [
+            "convert",
+            f"{source_format}:-",
+            "-coalesce",
+            "-resize",
+            f"{COMMENT_ANIMATION_MAX_DIMENSION}x{COMMENT_ANIMATION_MAX_DIMENSION}>",
+            "-layers",
+            "Optimize",
+            "gif:-",
+        ],
         input=data,
         check=True,
         capture_output=True,
     ).stdout
-    if len(converted) > MAX_COMMENT_IMAGE_BYTES:
-        raise RuntimeError("Converted comment animation exceeds the size limit")
-    return converted
+    return ensure_comment_media_size(converted)
 
 
 def classify_comment_media(data: bytes, content_type: str) -> DownloadedCommentMedia:
@@ -1144,6 +1173,16 @@ def classify_comment_media(data: bytes, content_type: str) -> DownloadedCommentM
             data=data,
             kind=RichCommentMediaKind.ANIMATION,
             suffix=".gif",
+        )
+    if normalized_type in HEIF_CONTENT_TYPES or (
+        len(data) >= 12 and data[4:8] == b"ftyp" and data[8:12] in HEIF_BRANDS
+    ):
+        converted = convert_comment_media_to_jpeg(data)
+        return DownloadedCommentMedia(
+            content_type="image/jpeg",
+            data=converted,
+            kind=RichCommentMediaKind.PHOTO,
+            suffix=".jpg",
         )
     if len(data) >= 12 and data[4:8] == b"ftyp":
         return DownloadedCommentMedia(
@@ -1161,7 +1200,7 @@ def classify_comment_media(data: bytes, content_type: str) -> DownloadedCommentM
         )
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         if b"acTL" in data:
-            converted = convert_comment_animation(data, "png")
+            converted = convert_comment_animation(data, CommentAnimationSourceFormat.PNG)
             return DownloadedCommentMedia(
                 content_type="image/gif",
                 data=converted,
@@ -1175,14 +1214,14 @@ def classify_comment_media(data: bytes, content_type: str) -> DownloadedCommentM
             suffix=".png",
         )
     if data.startswith(b"RIFF") and data[8:12] == b"WEBP" and b"ANIM" in data:
-        converted = convert_comment_animation(data, "webp")
+        converted = convert_comment_animation(data, CommentAnimationSourceFormat.WEBP)
         return DownloadedCommentMedia(
             content_type="image/gif",
             data=converted,
             kind=RichCommentMediaKind.ANIMATION,
             suffix=".gif",
         )
-    converted = convert_comment_media(data, "jpeg")
+    converted = convert_comment_media_to_jpeg(data)
     return DownloadedCommentMedia(
         content_type="image/jpeg",
         data=converted,
@@ -1219,7 +1258,7 @@ def download_comment_media(url: str) -> DownloadedCommentMedia:
 def download_comment_image(url: str, index: int) -> tuple[str, io.BytesIO, str]:
     media = download_comment_media(url)
     data = (
-        convert_comment_media(media.data, "jpeg")
+        convert_comment_media_to_jpeg(media.data)
         if media.kind == RichCommentMediaKind.ANIMATION
         else media.data
     )
