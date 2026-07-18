@@ -47,8 +47,6 @@ INLINE_RESULT_ID_MAX_LENGTH = 64
 CONVERTAPI_TOKEN = os.getenv("CONVERTAPI_TOKEN", "")
 CONVERTAPI_WEBP_TO_GIF_URL = "https://v2.convertapi.com/convert/webp/to/gif"
 CONVERTAPI_TIMEOUT_SECONDS = 30
-# Temporary public host for comment images/GIFs used in captions as links.
-# litterbox keeps files for a short TTL without requiring an account.
 EXTERNAL_MEDIA_UPLOAD_URL = os.getenv(
     "EXTERNAL_MEDIA_UPLOAD_URL",
     "https://litterbox.catbox.moe/resources/internals/api.php",

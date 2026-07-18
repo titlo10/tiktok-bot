@@ -256,7 +256,6 @@ def validate_configuration() -> None:
             chat.get("title") or chat.get("username") or chat.get("id"),
         )
     except TelegramAPIError as exc:
-        # Common when the bot was not yet added to the storage group/channel.
         logger.error(
             "Storage chat %s is not accessible (%s). Add the bot to that chat "
             "(admin in channels) so it can cache file_id for inline results.",
@@ -787,9 +786,6 @@ def upload_video_for_file_id(path: Path) -> str:
         temporary = True
 
     try:
-        # Always multipart-upload. Local Bot API raises size limits, but file://
-        # paths only work when the API process can read the host path (not true
-        # for the shared Docker telegram-bot-api on this host).
         data = {**telegram_chat_data(), "supports_streaming": "true"}
         with upload_path.open("rb") as video_file:
             result = telegram_call(
@@ -981,7 +977,6 @@ def process_telegram_updates(db: sqlite3.Connection, timeout: int) -> None:
         update_id = int(update["update_id"])
         inline_query = update.get("inline_query")
         if isinstance(inline_query, dict):
-            # Telegram uses key "from"; TypedDict may map it differently depending on payload.
             if "from" in inline_query and "from_user" not in inline_query:
                 inline_query = {**inline_query, "from_user": inline_query["from"]}
             try:
