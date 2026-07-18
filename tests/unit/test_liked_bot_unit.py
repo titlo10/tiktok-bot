@@ -173,15 +173,99 @@ def test_process_updates_keeps_offset_on_handler_failure(monkeypatch, tmp_path) 
     assert liked_bot.get_metadata(db, liked_bot.TELEGRAM_UPDATE_OFFSET_KEY) == "11"
 
 
-def test_format_inline_caption_includes_comments_and_media_links() -> None:
-    caption = liked_bot.format_inline_caption(
-        "765",
-        [{"username": "alice", "text": "hi", "likes": 3}],
-        ["https://example.test/a.gif"],
+def test_format_inline_caption_is_source_link_only() -> None:
+    caption = liked_bot.format_inline_caption("765")
+    assert caption == "https://www.tiktok.com/@/video/765"
+
+
+def test_build_rich_message_html_embeds_images_and_animations() -> None:
+    html = liked_bot.build_rich_message_html(
+        [
+            {
+                "username": "alice",
+                "text": "hi",
+                "rich_media": [
+                    {
+                        "kind": liked_bot.RichCommentMediaKind.PHOTO,
+                        "url": "https://example.test/a.jpg",
+                    },
+                    {
+                        "kind": liked_bot.RichCommentMediaKind.ANIMATION,
+                        "url": "https://example.test/b.gif",
+                    },
+                ],
+            }
+        ]
     )
-    assert "https://www.tiktok.com/@/video/765" in caption
-    assert "@alice" in caption
-    assert "https://example.test/a.gif" in caption
+    assert "@alice" in html
+    assert "hi" in html
+    assert '<img src="https://example.test/a.jpg">' in html
+    assert '<video src="https://example.test/b.gif"></video>' in html
+
+
+def test_handle_via_bot_message_sends_rich_reply(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "state.sqlite3"
+    monkeypatch.setattr(liked_bot, "STATE_DB", db_path)
+    db = liked_bot.connect_db()
+    monkeypatch.setattr(liked_bot, "BOT_INFO", {"id": 42, "username": "witchcult_bot"})
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        liked_bot,
+        "fetch_top_comments",
+        lambda video_id: [{"username": "alice", "text": "hi", "likes": 1, "image_urls": []}],
+    )
+    monkeypatch.setattr(
+        liked_bot,
+        "enrich_comments_with_external_media",
+        lambda comments: comments,
+    )
+    monkeypatch.setattr(
+        liked_bot,
+        "send_rich_comments_with_fallbacks",
+        lambda chat_id, reply_to, comments: calls.append((chat_id, reply_to, comments)) or 55,
+    )
+
+    liked_bot.handle_via_bot_message(
+        db,
+        {
+            "message_id": 7,
+            "chat": {"id": -100},
+            "via_bot": {"id": 42, "username": "witchcult_bot"},
+            "caption": "https://www.tiktok.com/@u/video/7658587349265255694",
+            "video": {"file_id": "f1"},
+        },
+    )
+
+    assert calls == [
+        (
+            -100,
+            7,
+            [{"username": "alice", "text": "hi", "likes": 1, "image_urls": []}],
+        )
+    ]
+    assert liked_bot.rich_reply_already_sent(db, -100, 7)
+
+
+def test_handle_via_bot_message_ignores_other_bots(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "state.sqlite3"
+    monkeypatch.setattr(liked_bot, "STATE_DB", db_path)
+    db = liked_bot.connect_db()
+    monkeypatch.setattr(liked_bot, "BOT_INFO", {"id": 42, "username": "witchcult_bot"})
+    called = []
+    monkeypatch.setattr(
+        liked_bot, "fetch_top_comments", lambda *_a: called.append("fetch") or []
+    )
+
+    liked_bot.handle_via_bot_message(
+        db,
+        {
+            "message_id": 7,
+            "chat": {"id": -100},
+            "via_bot": {"id": 99, "username": "other"},
+            "caption": "https://www.tiktok.com/@u/video/765",
+        },
+    )
+    assert called == []
 
 
 def test_classify_comment_media_preserves_supported_formats() -> None:

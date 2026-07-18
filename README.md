@@ -1,74 +1,56 @@
 # TikTok Bot
 
-Inline-only Telegram-бот: в любом чате пишете `@имя_бота` и ссылку на TikTok.
-Бот скачивает ролик и отдаёт **inline-результат**; после выбора видео уходит
-**от вашего имени** (как обычное сообщение через inline).
+Гибридный Telegram-бот:
+
+1. В чате: `@имя_бота` + ссылка на TikTok → **видео уходит от вашего имени** (inline).
+2. Бот, состоя в том же чате, видит сообщение `via_bot` и отвечает **RichMessage**
+   с топ-комментариями (текст + картинки/GIF).
 
 ## Как пользоваться
 
-1. В BotFather у бота должен быть включён inline mode (`/setinline`).
-2. В чате: `@your_bot https://www.tiktok.com/@user/video/…` (или `vm.tiktok.com/…`).
-3. Дождитесь результата и нажмите на него — видео отправится от вашего имени.
-4. В подписи к видео: исходная ссылка, топ-комментарии текстом и ссылки на
-   картинки/GIF из комментариев (если удалось перезалить).
+1. BotFather: **inline mode** (`/setinline`) — обязательно.
+2. Бот должен **видеть сообщения в группе**:
+   - либо **админ**,
+   - либо BotFather → `/setprivacy` → **Disable**.
+3. В чате: `@your_bot https://www.tiktok.com/@user/video/…`
+4. Выберите результат — видео от вас; следом reply от бота с комментариями.
 
-## Медиа из комментариев
+В caption к видео — только ссылка на TikTok (по ней бот узнаёт `video_id`).
+
+## RichMessage и медиа
 
 `sendRichMessage` с `<img>`/`<video>` требует **публичный HTTPS URL**.
-Свой nginx/хостинг на сервере больше не используется.
+Свой nginx больше не используется.
 
-Картинки и GIF из комментариев перезаливаются на временный сторонний хост
-[litterbox.catbox.moe](https://litterbox.catbox.moe) (по умолчанию TTL 24h).
-Ссылки попадают в caption. Переопределение:
+Картинки/GIF из комментариев перезаливаются на
+[litterbox.catbox.moe](https://litterbox.catbox.moe) (TTL 24h по умолчанию):
 
 - `EXTERNAL_MEDIA_UPLOAD_URL`
 - `EXTERNAL_MEDIA_TTL` (`1h` / `12h` / `24h` / `72h`)
 
-URL файлов Telegram (`/file/bot<token>/…`) не используются: они светят токен.
+Если RichMessage недоступен или медиа не подтянулось — fallback: обычный
+текстовый reply с топ-комментариями.
 
 ## Конфигурация
 
-Конфиг и cookies только на сервере в `/opt/tiktok-bot/shared/config`.
+Конфиг только на сервере в `/opt/tiktok-bot/shared/config`.
 
 | Параметр | Назначение |
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | токен бота |
 | `TELEGRAM_CHAT_ID` | служебный чат для кэша `file_id` (сообщение сразу удаляется) |
-| `COOKIES_FILE` | опционально: cookies TikTok (для комментариев / если yt-dlp упирается в login wall) |
-| `KEEP_DOWNLOADS` | оставлять ли скачанные mp4 на диске |
-| `CONVERTAPI_TOKEN` | опционально: удалённая конвертация animated WebP → GIF |
+| `COOKIES_FILE` | опционально: cookies TikTok (комментарии / login wall) |
+| `KEEP_DOWNLOADS` | оставлять ли скачанные mp4 |
+| `CONVERTAPI_TOKEN` | опционально: animated WebP → GIF |
 
-Локальный Telegram Bot API Server (`TELEGRAM_API_BASE_URL` + `TELEGRAM_LOCAL_MODE`)
-нужен для роликов больше 50 МБ.
+Локальный Bot API (`TELEGRAM_API_BASE_URL` + `TELEGRAM_LOCAL_MODE`) — для
+файлов > 50 МБ. Нужен для `sendRichMessage`.
 
 ## Деплой
 
-Прод-сервер: `144.31.156.46` (SSH порт `4242`).
+Прод: `144.31.156.46` (SSH `4242`).
 
-Код лежит в `/opt/tiktok-bot` (releases + `current`), unit
-`tiktok-liked-bot.service`. Локальный Bot API (общий Docker) слушает
-`http://127.0.0.1:8081`.
-
-Push в `main` → CI → GitHub Actions (vars `BER_HOST`, `BER_SSH_PORT=4242`,
-secret `BER_DEPLOY_KEY`) вызывает `deploy/deploy-tiktok-bot`.
-
-### Первый запуск на сервере
-
-В `/opt/tiktok-bot/shared/config/`:
-
-1. `settings.conf` — `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` (обязательно)
-2. опционально `cookies.txt` — для топ-комментариев и части «закрытых» роликов
-3. опционально `secrets.env` — `CONVERTAPI_TOKEN=…`
-
-Для inline-скачивания публичных ссылок cookies **не нужны**. Раньше они
-использовались для импорта лайков/saved — этот режим бот больше не крутит.
-
-`TELEGRAM_CHAT_ID` — **не** чат «куда слать ролики». Это служебный чат/канал,
-куда бот кратковременно загружает файл, чтобы получить `file_id` для
-`InlineQueryResultCachedVideo` (сообщение сразу удаляется). Видео в нужный
-чат уходит от имени пользователя через inline.
-
-В BotFather: `/setinline` (inline mode on).
+Push в `main` → CI → Deploy (`BER_HOST`, `BER_SSH_PORT`, `BER_DEPLOY_KEY`).
 
 ```bash
 systemctl restart tiktok-liked-bot.service

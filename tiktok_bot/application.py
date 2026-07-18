@@ -13,6 +13,7 @@ import time
 import unicodedata
 from contextlib import closing
 from datetime import datetime
+from html import escape
 from pathlib import Path
 
 import requests
@@ -30,6 +31,8 @@ from tiktok_bot.config import (
     KEEP_DOWNLOADS,
     MAX_CAPTION_LENGTH,
     MAX_COMMENT_IMAGE_BYTES,
+    MAX_COMMENT_IMAGES,
+    MAX_RICH_TEXT_LENGTH,
     MAX_VIDEO_BYTES,
     MIN_FREE_DISK_BYTES,
     POLL_ERROR_BACKOFF_MAX_SECONDS,
@@ -56,9 +59,11 @@ from tiktok_bot.domain import (
     CommentAnimationSourceFormat,
     DownloadedCommentMedia,
     JsonObject,
+    RichCommentMedia,
     RichCommentMediaKind,
     TelegramAPIError,
     TelegramInlineQuery,
+    TelegramMessage,
     TelegramMethod,
     TelegramUpdate,
     TikTokComment,
@@ -67,6 +72,7 @@ from tiktok_bot.domain import (
 logger = logging.getLogger("liked_bot")
 HEIF_CONTENT_TYPES = {"image/heic", "image/heif"}
 HEIF_BRANDS = {b"heic", b"heix", b"hevc", b"hevm", b"mif1", b"msf1"}
+BOT_INFO: JsonObject | None = None
 
 
 def normalize_comment_text(text: str) -> str:
@@ -103,6 +109,19 @@ def connect_db() -> sqlite3.Connection:
             file_id TEXT NOT NULL,
             caption TEXT NOT NULL DEFAULT '',
             cached_at TEXT NOT NULL
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rich_replies (
+            chat_id TEXT NOT NULL,
+            message_id INTEGER NOT NULL,
+            video_id TEXT NOT NULL,
+            rich_message_id INTEGER,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (chat_id, message_id)
         )
         """
     )
@@ -185,7 +204,7 @@ def telegram_get_updates(offset: int | None, timeout: int) -> list[TelegramUpdat
     data: dict[str, str | int] = {
         "limit": TELEGRAM_UPDATE_LIMIT,
         "timeout": timeout,
-        "allowed_updates": json.dumps(["inline_query"]),
+        "allowed_updates": json.dumps(["inline_query", "message", "channel_post"]),
     }
     if offset is not None:
         data["offset"] = offset
@@ -194,6 +213,65 @@ def telegram_get_updates(offset: int | None, timeout: int) -> list[TelegramUpdat
     if not isinstance(result, list):
         raise RuntimeError("Telegram returned invalid updates payload")
     return result
+
+
+def our_bot_id() -> int | None:
+    if not BOT_INFO:
+        return None
+    try:
+        return int(BOT_INFO["id"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def message_is_via_our_bot(message: TelegramMessage) -> bool:
+    via_bot = message.get("via_bot") or {}
+    bot_id = our_bot_id()
+    if bot_id is not None and via_bot.get("id") is not None:
+        try:
+            return int(via_bot["id"]) == bot_id
+        except (TypeError, ValueError):
+            pass
+    bot_username = str((BOT_INFO or {}).get("username") or "").casefold()
+    via_username = str(via_bot.get("username") or "").casefold()
+    return bool(bot_username and via_username and bot_username == via_username)
+
+
+def rich_reply_already_sent(db: sqlite3.Connection, chat_id: str | int, message_id: int) -> bool:
+    row = db.execute(
+        """
+        SELECT 1 FROM rich_replies
+        WHERE chat_id = ? AND message_id = ? AND status = 'sent'
+        """,
+        (str(chat_id), int(message_id)),
+    ).fetchone()
+    return row is not None
+
+
+def mark_rich_reply(
+    db: sqlite3.Connection,
+    chat_id: str | int,
+    message_id: int,
+    video_id: str,
+    status: str,
+    rich_message_id: int | None = None,
+) -> None:
+    db.execute(
+        """
+        INSERT OR REPLACE INTO rich_replies
+            (chat_id, message_id, video_id, rich_message_id, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(chat_id),
+            int(message_id),
+            video_id,
+            rich_message_id,
+            status,
+            datetime.now().isoformat(timespec="seconds"),
+        ),
+    )
+    db.commit()
 
 
 def delete_telegram_message(chat_id: str | int, message_id: int) -> None:
@@ -215,6 +293,8 @@ def delete_telegram_message(chat_id: str | int, message_id: int) -> None:
 
 
 def validate_configuration() -> None:
+    global BOT_INFO
+
     missing = [
         name
         for name, value in (
@@ -234,12 +314,12 @@ def validate_configuration() -> None:
             "comments and some restricted videos may fail"
         )
 
-    bot = telegram_call(TelegramMethod.GET_ME, {})
-    can_join_groups = bot.get("can_join_groups")
-    supports_inline = bot.get("supports_inline_queries")
+    BOT_INFO = telegram_call(TelegramMethod.GET_ME, {})
+    can_join_groups = BOT_INFO.get("can_join_groups")
+    supports_inline = BOT_INFO.get("supports_inline_queries")
     logger.info(
         "Telegram bot verified: @%s (inline=%s, groups=%s)",
-        bot.get("username", "unknown"),
+        BOT_INFO.get("username", "unknown"),
         supports_inline,
         can_join_groups,
     )
@@ -247,7 +327,7 @@ def validate_configuration() -> None:
         logger.error(
             "Inline mode is OFF for @%s. Enable it in BotFather (/setinline), "
             "otherwise @bot queries will not work.",
-            bot.get("username", "unknown"),
+            BOT_INFO.get("username", "unknown"),
         )
     try:
         chat = telegram_call(TelegramMethod.GET_CHAT, {"chat_id": settings.TELEGRAM_CHAT_ID})
@@ -262,6 +342,11 @@ def validate_configuration() -> None:
             settings.TELEGRAM_CHAT_ID,
             exc.description,
         )
+    logger.info(
+        "Hybrid mode: inline video from the user, then RichMessage comments "
+        "as a bot reply in the same chat (bot must see group messages: admin "
+        "or BotFather /setprivacy Disable)"
+    )
 
 
 def compressed_copy(source: Path) -> Path:
@@ -716,18 +801,30 @@ def upload_media_to_external_host(data: bytes, filename: str, content_type: str)
     return url
 
 
-def publish_comment_media_externally(comments: list[TikTokComment]) -> list[str]:
-    """Downloads comment images/GIFs and rehosts them externally. Returns public URLs."""
-    published: list[str] = []
-    seen: set[str] = set()
+def enrich_comments_with_external_media(comments: list[TikTokComment]) -> list[TikTokComment]:
+    """Rehosts comment images/GIFs externally and attaches them as rich_media."""
+    enriched: list[TikTokComment] = []
+    published_by_url: dict[str, RichCommentMedia] = {}
+    embedded = 0
+
     for comment in comments:
+        published_comment = dict(comment)
+        published_media: list[RichCommentMedia] = []
         groups = comment.get("image_url_candidates") or [
             [url] for url in comment.get("image_urls") or []
         ]
+        had_candidates = bool(groups)
         for candidates in groups:
+            if embedded >= MAX_COMMENT_IMAGES:
+                break
+            last_error: Exception | None = None
             for source_url in candidates:
-                if not is_http_url(source_url) or source_url in seen:
+                if not is_http_url(source_url):
                     continue
+                if cached := published_by_url.get(source_url):
+                    published_media.append(cached)
+                    embedded += 1
+                    break
                 try:
                     data, content_type = download_comment_media_bytes(source_url)
                     media = classify_comment_media(data, content_type)
@@ -736,44 +833,252 @@ def publish_comment_media_externally(comments: list[TikTokComment]) -> list[str]
                         f"comment{media.suffix}",
                         media.content_type,
                     )
+                    rich: RichCommentMedia = {"kind": media.kind, "url": public_url}
+                    published_by_url[source_url] = rich
+                    published_media.append(rich)
+                    embedded += 1
+                    break
                 except Exception as exc:
-                    logger.warning("Failed to rehost comment media %s: %s", source_url, exc)
+                    last_error = exc
                     continue
-                seen.add(source_url)
-                published.append(public_url)
-                break
-            if len(published) >= TOP_COMMENTS_LIMIT:
-                return published
-    return published
+            else:
+                if last_error is not None:
+                    logger.warning(
+                        "Failed to rehost comment media for @%s: %s",
+                        comment.get("username") or "anon",
+                        last_error,
+                    )
+
+        published_comment["rich_media"] = published_media
+        published_comment["image_urls"] = [
+            media["url"]
+            for media in published_media
+            if media["kind"] == RichCommentMediaKind.PHOTO
+        ]
+        if had_candidates and not published_media:
+            published_comment["image_publish_failed"] = True
+        enriched.append(published_comment)
+    return enriched
 
 
-def format_inline_caption(
-    video_id: str,
-    comments: list[TikTokComment],
-    media_urls: list[str],
-) -> str:
-    source = f"https://www.tiktok.com/@/video/{video_id}"
-    blocks = [source]
+def publish_comment_media_externally(comments: list[TikTokComment]) -> list[str]:
+    enriched = enrich_comments_with_external_media(comments)
+    urls: list[str] = []
+    for comment in enriched:
+        for media in comment.get("rich_media") or []:
+            urls.append(media["url"])
+    return urls
 
-    if comments:
-        blocks.append("")
-        blocks.append("Топ-комментарии:")
-        for index, comment in enumerate(comments, start=1):
-            author = f"@{comment['username']}" if comment.get("username") else "anon"
-            text = (comment.get("text") or "").strip() or "🖼"
-            likes = comment.get("likes") or 0
-            blocks.append(f"{index}. ❤️ {likes} · {author}: {text}")
 
-    if media_urls:
-        blocks.append("")
-        blocks.append("Медиа из комментариев:")
-        for url in media_urls:
-            blocks.append(url)
-
-    caption = "\n".join(blocks)
+def format_inline_caption(video_id: str) -> str:
+    caption = f"https://www.tiktok.com/@/video/{video_id}"
     if len(caption) <= MAX_CAPTION_LENGTH:
         return caption
     return caption[: MAX_CAPTION_LENGTH - 1].rstrip() + "…"
+
+
+def html_text(value: object, limit: int | None = None) -> str:
+    text = str(value or "").strip()
+    if limit is not None and len(text) > limit:
+        text = f"{text[: max(0, limit - 3)].rstrip()}..."
+    return escape(text)
+
+
+def html_paragraph(value: object, limit: int | None = None) -> str:
+    return html_text(" ".join(str(value or "").splitlines()), limit)
+
+
+def comment_details_html(comments: list[TikTokComment]) -> str:
+    if not comments:
+        return ""
+
+    blocks = [
+        "<details>",
+        "<summary>Комментарии</summary>",
+    ]
+    embedded_images = 0
+    for comment in comments:
+        username = str(comment.get("username") or "").strip()
+        if username:
+            blocks.append(f"<p><b>@{html_text(username)}</b></p>")
+
+        text = comment.get("text") or ""
+        if text:
+            blocks.append(f"<p>{html_paragraph(text, 1500)}</p>")
+            if comment.get("image_publish_failed"):
+                blocks.append("<p>Изображение не удалось встроить.</p>")
+        elif comment.get("image_publish_failed"):
+            blocks.append("<p>Изображение не удалось встроить.</p>")
+
+        rich_media = comment.get("rich_media") or [
+            {"kind": RichCommentMediaKind.PHOTO, "url": url}
+            for url in comment.get("image_urls") or []
+        ]
+        for media in rich_media:
+            if embedded_images >= MAX_COMMENT_IMAGES:
+                break
+            media_url = media["url"]
+            if not is_http_url(media_url):
+                continue
+            embedded_images += 1
+            escaped_url = escape(media_url, quote=True)
+            tag = "video" if media["kind"] == RichCommentMediaKind.ANIMATION else "img"
+            blocks.append(f'<figure><{tag} src="{escaped_url}"></{tag}></figure>')
+
+    blocks.append("</details>")
+    return "\n".join(blocks)
+
+
+def build_rich_message_html(comments: list[TikTokComment]) -> str:
+    html = comment_details_html(comments)
+    if len(html) > MAX_RICH_TEXT_LENGTH:
+        html = html[:MAX_RICH_TEXT_LENGTH].rsplit("\n", 1)[0]
+    return html
+
+
+def send_rich_comments(
+    chat_id: str | int,
+    reply_to_message_id: int,
+    comments: list[TikTokComment],
+) -> int:
+    html = build_rich_message_html(comments)
+    if not html.strip():
+        raise RuntimeError("No comment HTML to send")
+    result = telegram_call(
+        TelegramMethod.SEND_RICH_MESSAGE,
+        {
+            "chat_id": chat_id,
+            "rich_message": json.dumps({"html": html}, ensure_ascii=False),
+            "reply_parameters": json.dumps({"message_id": reply_to_message_id}),
+        },
+    )
+    return int(result["message_id"])
+
+
+def strip_comment_images(comments: list[TikTokComment]) -> list[TikTokComment]:
+    stripped = []
+    for comment in comments:
+        stripped_comment = dict(comment)
+        if stripped_comment.get("image_urls") or stripped_comment.get("rich_media"):
+            stripped_comment["image_publish_failed"] = True
+        stripped_comment["image_urls"] = []
+        stripped_comment["rich_media"] = []
+        stripped.append(stripped_comment)
+    return stripped
+
+
+def strip_comment_media_kind(
+    comments: list[TikTokComment], kind: RichCommentMediaKind
+) -> list[TikTokComment]:
+    stripped: list[TikTokComment] = []
+    for comment in comments:
+        stripped_comment = dict(comment)
+        remaining_media = [
+            media for media in comment.get("rich_media") or [] if media["kind"] != kind
+        ]
+        stripped_comment["rich_media"] = remaining_media
+        stripped_comment["image_urls"] = [
+            media["url"] for media in remaining_media if media["kind"] == RichCommentMediaKind.PHOTO
+        ]
+        stripped.append(stripped_comment)
+    return stripped
+
+
+def rich_media_missing_kind(error: Exception) -> str | None:
+    if not isinstance(error, TelegramAPIError):
+        return None
+
+    description = error.description
+    if "RICH_MESSAGE_PHOTO_NO_MEDIA_FOUND" in description:
+        return "photo"
+    if "RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND" in description:
+        return "video"
+    if "RICH_MESSAGE_AUDIO_NO_MEDIA_FOUND" in description:
+        return "audio"
+    if "RICH_MESSAGE_VIDEO_INVALID" in description:
+        return "animation"
+    if "RICH_MESSAGE_ANIMATION_INVALID" in description:
+        return "animation"
+    if "RICH_MESSAGE_PHOTO_INVALID" in description:
+        return "photo"
+    if "RICH_MESSAGE_" in description and "_NO_MEDIA_FOUND" in description:
+        return "media"
+    return None
+
+
+def send_plain_comments(
+    chat_id: str | int,
+    reply_to_message_id: int,
+    comments: list[TikTokComment],
+) -> int:
+    blocks = ["Топ-комментарии:"]
+    for index, comment in enumerate(comments, start=1):
+        author = f" · @{comment['username']}" if comment.get("username") else ""
+        text = (comment.get("text") or "")[:1000] or "🖼 Фото"
+        likes = comment.get("likes") or 0
+        blocks.append(f"{index}. ❤️ {likes}{author}\n{text}")
+    text = "\n\n".join(blocks)[:4096]
+    result = telegram_call(
+        TelegramMethod.SEND_MESSAGE,
+        {
+            "chat_id": chat_id,
+            "text": text,
+            "reply_parameters": json.dumps({"message_id": reply_to_message_id}),
+        },
+    )
+    return int(result["message_id"])
+
+
+def send_rich_comments_with_fallbacks(
+    chat_id: str | int,
+    reply_to_message_id: int,
+    comments: list[TikTokComment],
+) -> int:
+    rich_comments = comments
+    embedded_comment_images = any(comment.get("rich_media") for comment in comments)
+
+    while True:
+        try:
+            return send_rich_comments(chat_id, reply_to_message_id, rich_comments)
+        except Exception as exc:
+            missing_kind = rich_media_missing_kind(exc)
+            if not missing_kind:
+                raise
+
+            if missing_kind == "animation" and any(
+                media["kind"] == RichCommentMediaKind.ANIMATION
+                for comment in rich_comments
+                for media in comment.get("rich_media") or []
+            ):
+                rich_comments = strip_comment_media_kind(
+                    rich_comments, RichCommentMediaKind.ANIMATION
+                )
+                embedded_comment_images = any(
+                    comment.get("rich_media") for comment in rich_comments
+                )
+                continue
+
+            if missing_kind == "photo" and any(
+                media["kind"] == RichCommentMediaKind.PHOTO
+                for comment in rich_comments
+                for media in comment.get("rich_media") or []
+            ):
+                rich_comments = strip_comment_media_kind(rich_comments, RichCommentMediaKind.PHOTO)
+                embedded_comment_images = any(
+                    comment.get("rich_media") for comment in rich_comments
+                )
+                continue
+
+            if embedded_comment_images:
+                logger.warning(
+                    "Telegram could not fetch rich media: %s. Retrying without images.",
+                    exc,
+                )
+                rich_comments = strip_comment_images(rich_comments)
+                embedded_comment_images = False
+                continue
+
+            raise
 
 
 def upload_video_for_file_id(path: Path) -> str:
@@ -837,22 +1142,106 @@ def prepare_inline_video(db: sqlite3.Connection, video_id: str) -> CachedInlineV
     liked_at = int(time.time())
     path = download_tiktok_video_file(video_id, liked_at)
     try:
-        comments: list[TikTokComment] = []
-        media_urls: list[str] = []
-        try:
-            comments = fetch_top_comments(video_id)
-            media_urls = publish_comment_media_externally(comments)
-        except Exception:
-            logger.exception("Failed to load comments for video %s", video_id)
-
         file_id = upload_video_for_file_id(path)
-        caption = format_inline_caption(video_id, comments, media_urls)
+        caption = format_inline_caption(video_id)
         cached = CachedInlineVideo(video_id=video_id, file_id=file_id, caption=caption)
         store_cached_inline_video(db, cached)
         logger.info("Prepared inline video %s with file_id cache", video_id)
         return cached
     finally:
         cleanup_download(path)
+
+
+def extract_video_id_from_via_bot_message(message: TelegramMessage) -> str | None:
+    text = message.get("caption") or message.get("text") or ""
+    url = extract_tiktok_url(text)
+    if not url:
+        match = TIKTOK_VIDEO_ID_RE.search(text)
+        if match:
+            return match.group("video_id")
+        return None
+    try:
+        return extract_tiktok_video_id(url)
+    except Exception:
+        logger.exception("Could not parse TikTok id from via_bot caption")
+        return None
+
+
+def handle_via_bot_message(db: sqlite3.Connection, message: TelegramMessage) -> None:
+    if not message_is_via_our_bot(message):
+        return
+
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    message_id = message.get("message_id")
+    if chat_id is None or message_id is None:
+        return
+
+    if rich_reply_already_sent(db, chat_id, int(message_id)):
+        return
+
+    video_id = extract_video_id_from_via_bot_message(message)
+    if not video_id:
+        video = message.get("video") or {}
+        file_id = str(video.get("file_id") or "")
+        if file_id:
+            row = db.execute(
+                "SELECT video_id FROM inline_video_cache WHERE file_id = ?",
+                (file_id,),
+            ).fetchone()
+            if row:
+                video_id = str(row["video_id"])
+
+    if not video_id:
+        logger.info(
+            "via_bot message %s in chat %s has no TikTok video id; skip RichMessage",
+            message_id,
+            chat_id,
+        )
+        return
+
+    logger.info(
+        "Posting RichMessage comments for video %s as reply to message %s in chat %s",
+        video_id,
+        message_id,
+        chat_id,
+    )
+    try:
+        comments = fetch_top_comments(video_id)
+        if not comments:
+            mark_rich_reply(db, chat_id, int(message_id), video_id, "empty")
+            logger.info("No comments for video %s", video_id)
+            return
+
+        rich_comments = enrich_comments_with_external_media(comments)
+        try:
+            rich_message_id = send_rich_comments_with_fallbacks(
+                chat_id, int(message_id), rich_comments
+            )
+        except Exception:
+            logger.exception(
+                "RichMessage failed for video %s; falling back to plain text comments",
+                video_id,
+            )
+            rich_message_id = send_plain_comments(chat_id, int(message_id), comments)
+
+        mark_rich_reply(
+            db, chat_id, int(message_id), video_id, "sent", rich_message_id=rich_message_id
+        )
+        logger.info(
+            "Comments for video %s sent as message %s in chat %s",
+            video_id,
+            rich_message_id,
+            chat_id,
+        )
+    except Exception:
+        mark_rich_reply(db, chat_id, int(message_id), video_id, "failed")
+        logger.exception(
+            "Failed to deliver comments for video %s (message %s chat %s)",
+            video_id,
+            message_id,
+            chat_id,
+        )
 
 
 def answer_inline_query(
@@ -983,12 +1372,24 @@ def process_telegram_updates(db: sqlite3.Connection, timeout: int) -> None:
                 handle_inline_query(db, inline_query)
             except Exception:
                 logger.exception("Failed to handle inline_query update %s", update_id)
+
+        for key in ("message", "channel_post"):
+            message = update.get(key)
+            if isinstance(message, dict):
+                try:
+                    handle_via_bot_message(db, message)
+                except Exception:
+                    logger.exception("Failed to handle %s update %s", key, update_id)
+
         set_metadata(db, TELEGRAM_UPDATE_OFFSET_KEY, update_id + 1)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Inline-only Telegram bot: @bot + TikTok link → video from your name"
+        description=(
+            "Hybrid TikTok bot: @bot + link → video from your name; "
+            "bot replies with RichMessage comments in the same chat"
+        )
     )
     parser.add_argument("--once", action="store_true", help="Poll Telegram once and exit")
     parser.add_argument(

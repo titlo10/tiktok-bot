@@ -15,6 +15,8 @@ class TelegramMethod(StrEnum):
     GET_CHAT = "getChat"
     GET_ME = "getMe"
     GET_UPDATES = "getUpdates"
+    SEND_MESSAGE = "sendMessage"
+    SEND_RICH_MESSAGE = "sendRichMessage"
     SEND_VIDEO = "sendVideo"
 
 
@@ -39,6 +41,9 @@ class TelegramUser(TypedDict, total=False):
 
 class TelegramChat(TypedDict, total=False):
     id: str | int
+    title: str
+    type: str
+    username: str
 
 
 class TelegramMessage(TypedDict, total=False):
@@ -47,6 +52,7 @@ class TelegramMessage(TypedDict, total=False):
     date: int
     message_id: int
     text: str
+    via_bot: TelegramUser
     video: JsonObject
 
 
@@ -58,6 +64,7 @@ class TelegramInlineQuery(TypedDict, total=False):
 
 
 class TelegramUpdate(TypedDict, total=False):
+    channel_post: TelegramMessage
     inline_query: TelegramInlineQuery
     message: TelegramMessage
     update_id: int
@@ -66,9 +73,11 @@ class TelegramUpdate(TypedDict, total=False):
 class TikTokComment(TypedDict, total=False):
     created_at: int
     has_sticker: bool
+    image_publish_failed: bool
     image_url_candidates: list[list[str]]
     image_urls: list[str]
     likes: int
+    rich_media: list["RichCommentMedia"]
     text: str
     username: str
 
