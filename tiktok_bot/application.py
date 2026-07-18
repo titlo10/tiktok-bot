@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import http.cookiejar
 import io
 import json
@@ -14,8 +13,6 @@ import time
 import unicodedata
 from contextlib import closing
 from datetime import datetime
-from html import escape
-from itertools import islice
 from pathlib import Path
 
 import requests
@@ -26,31 +23,26 @@ from tiktok_bot.config import (
     CONVERTAPI_TIMEOUT_SECONDS,
     CONVERTAPI_TOKEN,
     CONVERTAPI_WEBP_TO_GIF_URL,
+    EXTERNAL_MEDIA_TTL,
+    EXTERNAL_MEDIA_UPLOAD_URL,
+    INLINE_CACHE_TIME_SECONDS,
+    INLINE_RESULT_ID_MAX_LENGTH,
     KEEP_DOWNLOADS,
-    KNOWN_STREAK_LIMIT,
-    MAX_COMMENT_ATTEMPTS,
+    MAX_CAPTION_LENGTH,
     MAX_COMMENT_IMAGE_BYTES,
-    MAX_COMMENT_IMAGES,
-    MAX_COMMENT_MEDIA_ATTEMPTS,
-    MAX_RICH_TEXT_LENGTH,
     MAX_VIDEO_BYTES,
     MIN_FREE_DISK_BYTES,
     POLL_ERROR_BACKOFF_MAX_SECONDS,
-    RICH_MEDIA_DIR,
-    RICH_MEDIA_PUBLIC_BASE_URL,
-    RICH_MEDIA_SUFFIXES,
-    RICH_MEDIA_TTL_SECONDS,
-    SCAN_LIMIT,
     STATE_DB,
     STICKER_MARKER_RE,
     TELEGRAM_API_BASE_URL,
-    TELEGRAM_LOCAL_MODE,
     TELEGRAM_UPDATE_LIMIT,
     TELEGRAM_UPDATE_OFFSET_KEY,
     TELEGRAM_UPDATE_TIMEOUT,
     TELEGRAM_UPLOAD_LIMIT,
     TIKTOK_QUERY_VIDEO_ID_RE,
     TIKTOK_SINGLE_URL_RE,
+    TIKTOK_URL_SEARCH_RE,
     TIKTOK_VIDEO_ID_RE,
     TIKTOK_WEB_USER_AGENT,
     TOP_COMMENTS_LIMIT,
@@ -58,20 +50,16 @@ from tiktok_bot.config import (
 
 from atp import settings
 from atp.models import Video, VideoStatus
-from atp.tiktok import download_video, get_user_liked_videos, yt_dlp_request
+from atp.tiktok import download_video
 from tiktok_bot.domain import (
+    CachedInlineVideo,
     CommentAnimationSourceFormat,
-    DeliveredTikTokVideo,
-    DeliveryStatus,
     DownloadedCommentMedia,
     JsonObject,
-    PublishedRichMedia,
-    RichMediaSource,
-    RichCommentMedia,
     RichCommentMediaKind,
     TelegramAPIError,
+    TelegramInlineQuery,
     TelegramMethod,
-    TelegramMessage,
     TelegramUpdate,
     TikTokComment,
 )
@@ -102,50 +90,19 @@ def connect_db() -> sqlite3.Connection:
     db.execute("PRAGMA journal_mode=WAL")
     db.execute(
         """
-        CREATE TABLE IF NOT EXISTS liked_videos (
-            video_id TEXT PRIMARY KEY,
-            liked_at INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            attempts INTEGER NOT NULL DEFAULT 0,
-            first_seen_at TEXT NOT NULL,
-            sent_at TEXT,
-            last_error TEXT,
-            video_message_id INTEGER,
-            comments_status TEXT NOT NULL DEFAULT 'pending',
-            comments_attempts INTEGER NOT NULL DEFAULT 0,
-            comments_last_error TEXT,
-            comments_message_id INTEGER,
-            comment_media_status TEXT NOT NULL DEFAULT 'pending',
-            comment_media_attempts INTEGER NOT NULL DEFAULT 0,
-            comment_media_last_error TEXT
-        )
-        """
-    )
-    columns = {row["name"] for row in db.execute("PRAGMA table_info(liked_videos)")}
-    comments_feature_is_new = "comments_status" not in columns
-    comment_media_feature_is_new = "comment_media_status" not in columns
-    migrations = {
-        "video_message_id": "INTEGER",
-        "comments_status": "TEXT NOT NULL DEFAULT 'pending'",
-        "comments_attempts": "INTEGER NOT NULL DEFAULT 0",
-        "comments_last_error": "TEXT",
-        "comments_message_id": "INTEGER",
-        "comment_media_status": "TEXT NOT NULL DEFAULT 'pending'",
-        "comment_media_attempts": "INTEGER NOT NULL DEFAULT 0",
-        "comment_media_last_error": "TEXT",
-    }
-    for column, definition in migrations.items():
-        if column not in columns:
-            db.execute(f"ALTER TABLE liked_videos ADD COLUMN {column} {definition}")
-    if comments_feature_is_new:
-        db.execute("UPDATE liked_videos SET comments_status = 'skipped'")
-    if comment_media_feature_is_new:
-        db.execute("UPDATE liked_videos SET comment_media_status = 'skipped'")
-    db.execute(
-        """
         CREATE TABLE IF NOT EXISTS metadata (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS inline_video_cache (
+            video_id TEXT PRIMARY KEY,
+            file_id TEXT NOT NULL,
+            caption TEXT NOT NULL DEFAULT '',
+            cached_at TEXT NOT NULL
         )
         """
     )
@@ -168,141 +125,38 @@ def set_metadata(db: sqlite3.Connection, key: str, value: str | int) -> None:
     db.commit()
 
 
-def is_initialized(db: sqlite3.Connection) -> bool:
-    return get_metadata(db, "initialized") == "1"
-
-
-def parse_entry(entry: JsonObject) -> tuple[str, int] | None:
-    video_id = str(entry.get("id") or "").strip()
-    timestamp = entry.get("timestamp")
-    if not video_id.isdigit() or timestamp is None:
-        return None
-    try:
-        return video_id, int(timestamp)
-    except (TypeError, ValueError):
-        return None
-
-
-def scan_likes(db: sqlite3.Connection) -> list[tuple[str, int]]:
-    entries = get_user_liked_videos(settings.TIKTOK_USER)
-    result: list[tuple[str, int]] = []
-    initialized = is_initialized(db)
-    known_streak = 0
-    try:
-        for entry in islice(entries, SCAN_LIMIT):
-            parsed = parse_entry(entry)
-            if parsed:
-                result.append(parsed)
-                if initialized:
-                    row = db.execute(
-                        "SELECT 1 FROM liked_videos WHERE video_id = ?", (parsed[0],)
-                    ).fetchone()
-                    known_streak = known_streak + 1 if row else 0
-                    if known_streak >= KNOWN_STREAK_LIMIT:
-                        break
-    finally:
-        close_entries = getattr(entries, "close", None)
-        if callable(close_entries):
-            close_entries()
-    return result
-
-
-def seed_baseline(db: sqlite3.Connection, likes: list[tuple[str, int]]) -> None:
-    now = datetime.now().isoformat(timespec="seconds")
-    db.executemany(
+def get_cached_inline_video(db: sqlite3.Connection, video_id: str) -> CachedInlineVideo | None:
+    row = db.execute(
         """
-        INSERT OR IGNORE INTO liked_videos
-            (
-                video_id,
-                liked_at,
-                status,
-                first_seen_at,
-                comments_status,
-                comment_media_status
-            )
-        VALUES (?, ?, 'baseline', ?, 'skipped', 'skipped')
+        SELECT video_id, file_id, caption
+        FROM inline_video_cache
+        WHERE video_id = ?
         """,
-        [(video_id, liked_at, now) for video_id, liked_at in likes],
+        (video_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return CachedInlineVideo(
+        video_id=str(row["video_id"]),
+        file_id=str(row["file_id"]),
+        caption=str(row["caption"] or ""),
     )
-    db.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('initialized', '1')")
-    db.commit()
-    logger.info("Baseline initialized with %d current liked videos", len(likes))
 
 
-def register_new_likes(
-    db: sqlite3.Connection, likes: list[tuple[str, int]]
-) -> list[tuple[str, int]]:
-    new_likes: list[tuple[str, int]] = []
-    known_streak = 0
-    now = datetime.now().isoformat(timespec="seconds")
-
-    for video_id, liked_at in likes:
-        row = db.execute(
-            "SELECT status FROM liked_videos WHERE video_id = ?", (video_id,)
-        ).fetchone()
-        if row:
-            known_streak += 1
-            if known_streak >= KNOWN_STREAK_LIMIT:
-                break
-            continue
-
-        known_streak = 0
-        db.execute(
-            """
-            INSERT INTO liked_videos
-                (video_id, liked_at, status, first_seen_at)
-            VALUES (?, ?, 'pending', ?)
-            """,
-            (video_id, liked_at, now),
-        )
-        new_likes.append((video_id, liked_at))
-
-    db.commit()
-    return list(reversed(new_likes))
-
-
-def pending_likes(db: sqlite3.Connection) -> list[tuple[str, int]]:
-    rows = db.execute(
+def store_cached_inline_video(db: sqlite3.Connection, cached: CachedInlineVideo) -> None:
+    db.execute(
         """
-        SELECT video_id, liked_at
-        FROM liked_videos
-        WHERE status IN ('pending', 'failed')
-        ORDER BY liked_at ASC
-        """
-    ).fetchall()
-    return [(row["video_id"], row["liked_at"]) for row in rows]
-
-
-def pending_comments(db: sqlite3.Connection) -> list[tuple[str, int]]:
-    rows = db.execute(
-        """
-        SELECT video_id, video_message_id
-        FROM liked_videos
-        WHERE status = 'sent'
-          AND comments_status IN ('pending', 'failed')
-          AND comments_attempts < ?
-          AND video_message_id IS NOT NULL
-        ORDER BY sent_at ASC
+        INSERT OR REPLACE INTO inline_video_cache (video_id, file_id, caption, cached_at)
+        VALUES (?, ?, ?, ?)
         """,
-        (MAX_COMMENT_ATTEMPTS,),
-    ).fetchall()
-    return [(row["video_id"], row["video_message_id"]) for row in rows]
-
-
-def pending_comment_media(db: sqlite3.Connection) -> list[tuple[str, int]]:
-    rows = db.execute(
-        """
-        SELECT video_id, COALESCE(comments_message_id, video_message_id) AS parent_message_id
-        FROM liked_videos
-        WHERE comments_status = 'sent'
-          AND comment_media_status IN ('pending', 'failed')
-          AND comment_media_attempts < ?
-          AND (comments_message_id IS NOT NULL OR video_message_id IS NOT NULL)
-        ORDER BY sent_at ASC
-        """,
-        (MAX_COMMENT_MEDIA_ATTEMPTS,),
-    ).fetchall()
-    return [(row["video_id"], row["parent_message_id"]) for row in rows]
+        (
+            cached.video_id,
+            cached.file_id,
+            cached.caption,
+            datetime.now().isoformat(timespec="seconds"),
+        ),
+    )
+    db.commit()
 
 
 def telegram_call(
@@ -331,7 +185,7 @@ def telegram_get_updates(offset: int | None, timeout: int) -> list[TelegramUpdat
     data: dict[str, str | int] = {
         "limit": TELEGRAM_UPDATE_LIMIT,
         "timeout": timeout,
-        "allowed_updates": json.dumps(["message"]),
+        "allowed_updates": json.dumps(["inline_query"]),
     }
     if offset is not None:
         data["offset"] = offset
@@ -360,39 +214,55 @@ def delete_telegram_message(chat_id: str | int, message_id: int) -> None:
         )
 
 
-def send_upload_action(chat_id: str | int) -> None:
-    try:
-        telegram_call(
-            TelegramMethod.SEND_CHAT_ACTION,
-            {
-                "chat_id": chat_id,
-                "action": "upload_video",
-            },
-        )
-    except Exception as exc:
-        logger.debug("Could not send Telegram upload action: %s", exc)
-
-
 def validate_configuration() -> None:
     missing = [
         name
         for name, value in (
             ("TELEGRAM_BOT_TOKEN", settings.TELEGRAM_BOT_TOKEN),
             ("TELEGRAM_CHAT_ID", settings.TELEGRAM_CHAT_ID),
-            ("COOKIES_FILE", settings.COOKIES_FILE),
         )
         if not value
     ]
     if missing:
         raise RuntimeError(f"Missing configuration: {', '.join(missing)}")
 
+    if settings.COOKIES_FILE:
+        logger.info("TikTok cookies loaded from %s", settings.COOKIES_FILE)
+    else:
+        logger.info(
+            "TikTok cookies not configured — public video download still works; "
+            "comments and some restricted videos may fail"
+        )
+
     bot = telegram_call(TelegramMethod.GET_ME, {})
-    chat = telegram_call(TelegramMethod.GET_CHAT, {"chat_id": settings.TELEGRAM_CHAT_ID})
+    can_join_groups = bot.get("can_join_groups")
+    supports_inline = bot.get("supports_inline_queries")
     logger.info(
-        "Telegram access verified for bot @%s and chat %s",
+        "Telegram bot verified: @%s (inline=%s, groups=%s)",
         bot.get("username", "unknown"),
-        chat.get("title") or chat.get("username") or chat.get("id"),
+        supports_inline,
+        can_join_groups,
     )
+    if supports_inline is False:
+        logger.error(
+            "Inline mode is OFF for @%s. Enable it in BotFather (/setinline), "
+            "otherwise @bot queries will not work.",
+            bot.get("username", "unknown"),
+        )
+    try:
+        chat = telegram_call(TelegramMethod.GET_CHAT, {"chat_id": settings.TELEGRAM_CHAT_ID})
+        logger.info(
+            "Storage chat verified: %s",
+            chat.get("title") or chat.get("username") or chat.get("id"),
+        )
+    except TelegramAPIError as exc:
+        # Common when the bot was not yet added to the storage group/channel.
+        logger.error(
+            "Storage chat %s is not accessible (%s). Add the bot to that chat "
+            "(admin in channels) so it can cache file_id for inline results.",
+            settings.TELEGRAM_CHAT_ID,
+            exc.description,
+        )
 
 
 def compressed_copy(source: Path) -> Path:
@@ -453,124 +323,6 @@ def compressed_copy(source: Path) -> Path:
     return target
 
 
-def send_video(path: Path, reply_to_message_id: int | None = None) -> int:
-    upload_path = path
-    temporary = False
-    if path.stat().st_size > TELEGRAM_UPLOAD_LIMIT:
-        logger.info("Compressing %s for Telegram", path.name)
-        upload_path = compressed_copy(path)
-        temporary = True
-
-    try:
-        data = {**telegram_chat_data(), "supports_streaming": "true"}
-        if reply_to_message_id is not None:
-            data["reply_parameters"] = json.dumps({"message_id": reply_to_message_id})
-        if TELEGRAM_LOCAL_MODE:
-            data["video"] = upload_path.resolve().as_uri()
-            result = telegram_call(TelegramMethod.SEND_VIDEO, data)
-            return int(result["message_id"])
-        with upload_path.open("rb") as video_file:
-            result = telegram_call(
-                TelegramMethod.SEND_VIDEO,
-                data,
-                {"video": video_file},
-            )
-        return int(result["message_id"])
-    finally:
-        if temporary:
-            upload_path.unlink(missing_ok=True)
-
-
-def cleanup_rich_media() -> None:
-    if not RICH_MEDIA_DIR or not RICH_MEDIA_DIR.is_dir():
-        return
-
-    cutoff = time.time() - RICH_MEDIA_TTL_SECONDS
-    for path in RICH_MEDIA_DIR.iterdir():
-        if not path.is_file() or path.suffix.lower() not in RICH_MEDIA_SUFFIXES:
-            continue
-        try:
-            if path.stat().st_mtime < cutoff:
-                path.unlink()
-        except OSError as exc:
-            logger.warning("Failed to remove expired rich media %s: %s", path, exc)
-
-
-def publish_rich_bytes(
-    content: io.BytesIO,
-    video_id: str,
-    kind: str,
-    index: int,
-    suffix: str,
-) -> PublishedRichMedia | None:
-    if not RICH_MEDIA_DIR or not RICH_MEDIA_PUBLIC_BASE_URL:
-        return None
-
-    RICH_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = int(time.time())
-    safe_video_id = (
-        "".join(char for char in str(video_id) if char.isalnum() or char in {"-", "_"})[:80]
-        or "video"
-    )
-    filename = f"{safe_video_id}-{timestamp}-{kind}-{index}{suffix}"
-    destination = RICH_MEDIA_DIR / filename
-    temporary = destination.with_name(f"{destination.name}.tmp")
-
-    content.seek(0)
-    with temporary.open("wb") as output:
-        shutil.copyfileobj(content, output)
-    os.chmod(temporary, 0o644)
-    temporary.replace(destination)
-
-    url = f"{RICH_MEDIA_PUBLIC_BASE_URL}/{filename}"
-    if not destination.is_file() or destination.stat().st_size == 0:
-        raise RuntimeError(f"Published rich media is missing or empty: {destination}")
-
-    logger.info("Published rich comment image staging file %s", url)
-    return PublishedRichMedia(url=url, path=destination)
-
-
-def rich_image_is_publicly_available(published: PublishedRichMedia) -> bool:
-    """Checks that a staged comment image can be fetched through nginx."""
-    if not published.path.is_file() or published.path.stat().st_size == 0:
-        logger.warning("Published comment image is missing or empty: %s", published.path)
-        return False
-
-    response = None
-    try:
-        response = requests.get(
-            published.url,
-            headers={"User-Agent": TIKTOK_WEB_USER_AGENT},
-            stream=True,
-            timeout=20,
-        )
-        if response.status_code != 200:
-            logger.warning(
-                "Published comment image is not publicly available (%s): %s",
-                response.status_code,
-                published.url,
-            )
-            return False
-        public_content_type = response.headers.get("content-type", "").lower()
-        if not public_content_type.startswith(("image/", "video/")):
-            logger.warning(
-                "Published comment image has unexpected content type %r: %s",
-                response.headers.get("content-type"),
-                published.url,
-            )
-            return False
-        if not next(response.iter_content(chunk_size=1), b""):
-            logger.warning("Published comment image is empty over HTTP: %s", published.url)
-            return False
-        return True
-    except requests.RequestException as exc:
-        logger.warning("Could not verify published comment image %s: %s", published.url, exc)
-        return False
-    finally:
-        if response is not None:
-            response.close()
-
-
 def cleanup_download(path: Path) -> None:
     if KEEP_DOWNLOADS:
         return
@@ -609,6 +361,7 @@ def is_http_url(value: object) -> bool:
 
 
 def extract_single_tiktok_url(text: object) -> str | None:
+    """Accepts a bare TikTok URL (optionally with surrounding whitespace)."""
     if not isinstance(text, str):
         return None
     match = TIKTOK_SINGLE_URL_RE.fullmatch(text)
@@ -616,6 +369,22 @@ def extract_single_tiktok_url(text: object) -> str | None:
         return None
 
     url = match.group("url")
+    if not url.startswith(("https://", "http://")):
+        url = f"https://{url}"
+    return url
+
+
+def extract_tiktok_url(text: object) -> str | None:
+    """Finds a TikTok URL inside free-form inline query text."""
+    bare = extract_single_tiktok_url(text)
+    if bare:
+        return bare
+    if not isinstance(text, str):
+        return None
+    match = TIKTOK_URL_SEARCH_RE.search(text)
+    if not match:
+        return None
+    url = match.group(0)
     if not url.startswith(("https://", "http://")):
         url = f"https://{url}"
     return url
@@ -656,321 +425,6 @@ def extract_tiktok_video_id(url: str) -> str:
         return video_id
 
     raise RuntimeError("Could not extract TikTok video id from URL")
-
-
-def pick_best_video_url(info: JsonObject) -> str | None:
-    candidates = []
-    for media_format in info.get("formats") or []:
-        url = media_format.get("url")
-        if not is_http_url(url):
-            continue
-        if media_format.get("ext") != "mp4":
-            continue
-        if media_format.get("vcodec") in (None, "none"):
-            continue
-        candidates.append(media_format)
-
-    if not candidates and is_http_url(info.get("url")) and info.get("ext") == "mp4":
-        return str(info["url"])
-
-    if not candidates:
-        return None
-
-    def score(media_format: JsonObject) -> tuple[int, int, int, int]:
-        format_id = str(media_format.get("format_id") or "")
-        has_audio = media_format.get("acodec") not in (None, "none")
-        return (
-            1 if format_id == "download" else 0,
-            1 if has_audio else 0,
-            int(media_format.get("height") or 0),
-            int(media_format.get("tbr") or 0),
-        )
-
-    return str(max(candidates, key=score)["url"])
-
-
-def pick_best_audio_url(info: JsonObject) -> str | None:
-    candidates = []
-    for media_format in info.get("formats") or []:
-        url = media_format.get("url")
-        if not is_http_url(url):
-            continue
-        if media_format.get("acodec") in (None, "none"):
-            continue
-        if media_format.get("vcodec") not in (None, "none"):
-            continue
-        candidates.append(media_format)
-
-    if not candidates and is_http_url(info.get("url")):
-        return str(info["url"])
-
-    if not candidates:
-        return None
-
-    return str(candidates[-1]["url"])
-
-
-def fetch_rich_media_source(video_id: str) -> RichMediaSource:
-    info = yt_dlp_request(
-        {
-            "format": "best",
-            "quiet": True,
-            "no_warnings": True,
-        },
-        url=f"https://www.tiktok.com/@/video/{video_id}",
-        download=False,
-        always_retry=True,
-    )
-    if not isinstance(info, dict):
-        raise RuntimeError("TikTok returned invalid video metadata")
-
-    return RichMediaSource(
-        video_url=pick_best_video_url(info),
-        audio_url=pick_best_audio_url(info),
-        webpage_url=str(info.get("webpage_url") or f"https://www.tiktok.com/@/video/{video_id}"),
-        description=str(info.get("description") or info.get("title") or "").strip(),
-        uploader=str(info.get("uploader") or "").strip(),
-        duration=info.get("duration"),
-        view_count=info.get("view_count"),
-        like_count=info.get("like_count"),
-        comment_count=info.get("comment_count"),
-    )
-
-
-def html_text(value: object, limit: int | None = None) -> str:
-    text = str(value or "").strip()
-    if limit is not None and len(text) > limit:
-        text = f"{text[: max(0, limit - 3)].rstrip()}..."
-    return escape(text)
-
-
-def html_paragraph(value: object, limit: int | None = None) -> str:
-    return html_text(" ".join(str(value or "").splitlines()), limit)
-
-
-def format_count(value: object) -> str | None:
-    if value is None:
-        return None
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        return None
-    return f"{number:,}".replace(",", " ")
-
-
-def format_duration(seconds: object) -> str | None:
-    try:
-        total = int(seconds)
-    except (TypeError, ValueError):
-        return None
-    if total <= 0:
-        return None
-    minutes, remaining = divmod(total, 60)
-    return f"{minutes}:{remaining:02d}"
-
-
-def comment_details_html(comments: list[TikTokComment]) -> str:
-    if not comments:
-        return ""
-
-    blocks = [
-        "<details>",
-        "<summary>Комментарии</summary>",
-    ]
-    embedded_images = 0
-    for comment in comments:
-        username = str(comment.get("username") or "").strip()
-        if username:
-            blocks.append(f"<p><b>@{html_text(username)}</b></p>")
-
-        text = comment.get("text") or ""
-        if text:
-            blocks.append(f"<p>{html_paragraph(text, 1500)}</p>")
-            if comment.get("image_publish_failed"):
-                blocks.append("<p>Изображение не удалось встроить.</p>")
-        elif comment.get("image_publish_failed"):
-            blocks.append("<p>Изображение не удалось встроить.</p>")
-
-        rich_media = comment.get("rich_media") or [
-            {"kind": RichCommentMediaKind.PHOTO, "url": url}
-            for url in comment.get("image_urls") or []
-        ]
-        for media in rich_media:
-            if embedded_images >= MAX_COMMENT_IMAGES:
-                break
-            media_url = media["url"]
-            if not is_http_url(media_url):
-                continue
-            embedded_images += 1
-            escaped_url = escape(media_url, quote=True)
-            tag = "video" if media["kind"] == RichCommentMediaKind.ANIMATION else "img"
-            blocks.append(f'<figure><{tag} src="{escaped_url}"></{tag}></figure>')
-
-    blocks.append("</details>")
-    return "\n".join(blocks)
-
-
-def build_rich_message_html(
-    _video_id: str,
-    _liked_at: int,
-    source: RichMediaSource,
-    comments: list[TikTokComment],
-) -> str:
-    del _video_id, _liked_at, source
-    blocks = []
-
-    comments_html = comment_details_html(comments)
-    if comments_html:
-        blocks.append(comments_html)
-
-    html = "\n".join(blocks)
-    if len(html) > MAX_RICH_TEXT_LENGTH:
-        html = html[:MAX_RICH_TEXT_LENGTH].rsplit("\n", 1)[0]
-    return html
-
-
-def send_rich_tiktok_message(
-    video_id: str,
-    liked_at: int,
-    source: RichMediaSource,
-    comments: list[TikTokComment],
-    reply_to_message_id: int,
-) -> int:
-    html = build_rich_message_html(video_id, liked_at, source, comments)
-    result = telegram_call(
-        TelegramMethod.SEND_RICH_MESSAGE,
-        {
-            **telegram_chat_data(),
-            "rich_message": json.dumps({"html": html}, ensure_ascii=False),
-            "reply_parameters": json.dumps({"message_id": reply_to_message_id}),
-        },
-    )
-    return int(result["message_id"])
-
-
-def is_rich_media_missing(error: Exception) -> bool:
-    return (
-        isinstance(error, TelegramAPIError)
-        and "RICH_MESSAGE_" in error.description
-        and "_NO_MEDIA_FOUND" in error.description
-    )
-
-
-def strip_comment_images(comments: list[TikTokComment]) -> list[TikTokComment]:
-    stripped = []
-    for comment in comments:
-        stripped_comment = dict(comment)
-        if stripped_comment.get("image_urls"):
-            stripped_comment["image_publish_failed"] = True
-        stripped_comment["image_urls"] = []
-        stripped_comment["rich_media"] = []
-        stripped.append(stripped_comment)
-    return stripped
-
-
-def strip_comment_media_kind(
-    comments: list[TikTokComment], kind: RichCommentMediaKind
-) -> list[TikTokComment]:
-    stripped: list[TikTokComment] = []
-    for comment in comments:
-        stripped_comment = dict(comment)
-        remaining_media = [
-            media for media in comment.get("rich_media") or [] if media["kind"] != kind
-        ]
-        stripped_comment["rich_media"] = remaining_media
-        stripped_comment["image_urls"] = [
-            media["url"] for media in remaining_media if media["kind"] == RichCommentMediaKind.PHOTO
-        ]
-        stripped.append(stripped_comment)
-    return stripped
-
-
-def rich_media_missing_kind(error: Exception) -> str | None:
-    if not isinstance(error, TelegramAPIError):
-        return None
-
-    description = error.description
-    if "RICH_MESSAGE_PHOTO_NO_MEDIA_FOUND" in description:
-        return "photo"
-    if "RICH_MESSAGE_VIDEO_NO_MEDIA_FOUND" in description:
-        return "video"
-    if "RICH_MESSAGE_AUDIO_NO_MEDIA_FOUND" in description:
-        return "audio"
-    if "RICH_MESSAGE_VIDEO_INVALID" in description:
-        return "animation"
-    if "RICH_MESSAGE_ANIMATION_INVALID" in description:
-        return "animation"
-    if "RICH_MESSAGE_PHOTO_INVALID" in description:
-        return "photo"
-    if "RICH_MESSAGE_" in description and "_NO_MEDIA_FOUND" in description:
-        return "media"
-    return None
-
-
-def send_rich_tiktok_message_with_fallbacks(
-    video_id: str,
-    liked_at: int,
-    source: RichMediaSource,
-    comments: list[TikTokComment],
-    reply_to_message_id: int,
-) -> tuple[int, bool, bool]:
-    del source
-    rich_source = RichMediaSource()
-    rich_comments = comments
-    embedded_video = False
-    embedded_comment_images = any(comment.get("rich_media") for comment in comments)
-
-    while True:
-        try:
-            message_id = send_rich_tiktok_message(
-                video_id,
-                liked_at,
-                rich_source,
-                rich_comments,
-                reply_to_message_id,
-            )
-            return message_id, embedded_video, embedded_comment_images
-        except Exception as exc:
-            missing_kind = rich_media_missing_kind(exc)
-            if not missing_kind:
-                raise
-
-            if missing_kind == "animation" and any(
-                media["kind"] == RichCommentMediaKind.ANIMATION
-                for comment in rich_comments
-                for media in comment.get("rich_media") or []
-            ):
-                rich_comments = strip_comment_media_kind(
-                    rich_comments, RichCommentMediaKind.ANIMATION
-                )
-                embedded_comment_images = any(
-                    comment.get("rich_media") for comment in rich_comments
-                )
-                continue
-
-            if missing_kind == "photo" and any(
-                media["kind"] == RichCommentMediaKind.PHOTO
-                for comment in rich_comments
-                for media in comment.get("rich_media") or []
-            ):
-                rich_comments = strip_comment_media_kind(rich_comments, RichCommentMediaKind.PHOTO)
-                embedded_comment_images = any(
-                    comment.get("rich_media") for comment in rich_comments
-                )
-                continue
-
-            if embedded_comment_images:
-                logger.warning(
-                    "Telegram could not fetch rich media for video %s: %s. "
-                    "Retrying RichMessage without embedded comment images.",
-                    video_id,
-                    exc,
-                )
-                rich_comments = strip_comment_images(rich_comments)
-                embedded_comment_images = False
-                continue
-
-            raise
 
 
 def collect_media_url_groups(media_items: object) -> list[list[str]]:
@@ -1021,11 +475,11 @@ def collect_sticker_url_groups(item: JsonObject) -> list[list[str]]:
 
 
 def fetch_top_comments(video_id: str) -> list[TikTokComment]:
-    cookie_jar = http.cookiejar.MozillaCookieJar()
-    cookie_jar.load(settings.COOKIES_FILE, ignore_discard=True, ignore_expires=True)
-
     with requests.Session() as session:
-        session.cookies.update(cookie_jar)
+        if settings.COOKIES_FILE:
+            cookie_jar = http.cookiejar.MozillaCookieJar()
+            cookie_jar.load(settings.COOKIES_FILE, ignore_discard=True, ignore_expires=True)
+            session.cookies.update(cookie_jar)
         with session.get(
             "https://www.tiktok.com/api/comment/list/",
             params={
@@ -1076,15 +530,6 @@ def fetch_top_comments(video_id: str) -> list[TikTokComment]:
 
     comments.sort(key=lambda comment: (-comment["likes"], -comment["created_at"]))
     return comments[:TOP_COMMENTS_LIMIT]
-
-
-def format_top_comments(comments: list[TikTokComment]) -> str:
-    blocks = ["Топ-3 комментария:"]
-    for index, comment in enumerate(comments, start=1):
-        author = f" · @{comment['username']}" if comment["username"] else ""
-        text = comment["text"][:1000] or "🖼 Фото"
-        blocks.append(f"{index}. ❤️ {comment['likes']}{author}\n{text}")
-    return "\n\n".join(blocks)[:4096]
 
 
 def ensure_comment_media_size(data: bytes) -> bytes:
@@ -1250,306 +695,123 @@ def download_comment_media_bytes(url: str) -> tuple[bytes, str]:
     return content.getvalue(), content_type
 
 
-def download_comment_media(url: str) -> DownloadedCommentMedia:
-    data, content_type = download_comment_media_bytes(url)
-    return classify_comment_media(data, content_type)
+def upload_media_to_external_host(data: bytes, filename: str, content_type: str) -> str:
+    """Uploads bytes to a temporary third-party host (litterbox by default).
 
-
-def download_comment_image(url: str, index: int) -> tuple[str, io.BytesIO, str]:
-    media = download_comment_media(url)
-    data = (
-        convert_comment_media_to_jpeg(media.data)
-        if media.kind == RichCommentMediaKind.ANIMATION
-        else media.data
+    RichMessage / caption links need a public HTTPS URL. Telegram file links require the
+    bot token, so we deliberately avoid self-hosting and Telegram CDN URLs here.
+    """
+    response = requests.post(
+        EXTERNAL_MEDIA_UPLOAD_URL,
+        data={
+            "reqtype": "fileupload",
+            "time": EXTERNAL_MEDIA_TTL,
+        },
+        files={"fileToUpload": (filename, data, content_type)},
+        timeout=60,
     )
-    content = io.BytesIO(data)
-    return f"comment-{index}.jpg", content, "image/jpeg"
+    response.raise_for_status()
+    url = response.text.strip()
+    if not is_http_url(url):
+        raise RuntimeError(f"External media host returned invalid URL: {url[:200]!r}")
+    return url
 
 
-def publish_rich_comment_media(comments: list[TikTokComment], video_id: str) -> list[TikTokComment]:
-    if not RICH_MEDIA_DIR or not RICH_MEDIA_PUBLIC_BASE_URL:
-        return strip_comment_images(comments)
-
-    published_comments = []
-    image_index = 0
-    published_by_url: dict[str, RichCommentMedia] = {}
-    published_by_digest: dict[str, RichCommentMedia] = {}
-    embedded_urls: set[str] = set()
+def publish_comment_media_externally(comments: list[TikTokComment]) -> list[str]:
+    """Downloads comment images/GIFs and rehosts them externally. Returns public URLs."""
+    published: list[str] = []
+    seen: set[str] = set()
     for comment in comments:
-        published_comment = dict(comment)
-        published_media: list[RichCommentMedia] = []
-        duplicate_media = False
-        media_limit_reached = False
-        image_url_groups = comment.get("image_url_candidates") or [
+        groups = comment.get("image_url_candidates") or [
             [url] for url in comment.get("image_urls") or []
         ]
-        for candidates in image_url_groups:
-            last_error = None
-            for url in candidates:
-                if not is_http_url(url):
+        for candidates in groups:
+            for source_url in candidates:
+                if not is_http_url(source_url) or source_url in seen:
                     continue
-                if cached_media := published_by_url.get(url):
-                    if cached_media["url"] in embedded_urls:
-                        duplicate_media = True
-                    else:
-                        published_media.append(cached_media)
-                        embedded_urls.add(cached_media["url"])
-                    break
                 try:
-                    data, content_type = download_comment_media_bytes(url)
-                    digest = hashlib.sha256(data).hexdigest()
-                    if cached_media := published_by_digest.get(digest):
-                        published_by_url[url] = cached_media
-                        if cached_media["url"] in embedded_urls:
-                            duplicate_media = True
-                        else:
-                            published_media.append(cached_media)
-                            embedded_urls.add(cached_media["url"])
-                        break
-                    if len(embedded_urls) >= MAX_COMMENT_IMAGES:
-                        media_limit_reached = True
-                        break
+                    data, content_type = download_comment_media_bytes(source_url)
                     media = classify_comment_media(data, content_type)
-                    image_index += 1
-                    content = io.BytesIO(media.data)
-                    try:
-                        published = publish_rich_bytes(
-                            content,
-                            video_id,
-                            "comment",
-                            image_index,
-                            media.suffix,
-                        )
-                    finally:
-                        content.close()
-                except Exception as exc:
-                    last_error = exc
-                    continue
-
-                if published:
-                    if rich_image_is_publicly_available(published):
-                        rich_media: RichCommentMedia = {
-                            "kind": media.kind,
-                            "url": published.url,
-                        }
-                        published_by_url[url] = rich_media
-                        published_by_digest[digest] = rich_media
-                        published_media.append(rich_media)
-                        embedded_urls.add(rich_media["url"])
-                        break
-                    try:
-                        published.path.unlink(missing_ok=True)
-                    except OSError as exc:
-                        logger.warning(
-                            "Failed to remove unpublished comment image %s: %s",
-                            published.path,
-                            exc,
-                        )
-            else:
-                if last_error is not None:
-                    logger.warning(
-                        "Failed to publish comment image %d for video %s: %s",
-                        image_index,
-                        video_id,
-                        last_error,
+                    public_url = upload_media_to_external_host(
+                        media.data,
+                        f"comment{media.suffix}",
+                        media.content_type,
                     )
-
-        published_comment["image_urls"] = [
-            media["url"] for media in published_media if media["kind"] == RichCommentMediaKind.PHOTO
-        ]
-        published_comment["rich_media"] = published_media
-        if (
-            image_url_groups
-            and not published_media
-            and not duplicate_media
-            and not media_limit_reached
-        ):
-            published_comment["image_publish_failed"] = True
-        published_comments.append(published_comment)
-
-    return published_comments
+                except Exception as exc:
+                    logger.warning("Failed to rehost comment media %s: %s", source_url, exc)
+                    continue
+                seen.add(source_url)
+                published.append(public_url)
+                break
+            if len(published) >= TOP_COMMENTS_LIMIT:
+                return published
+    return published
 
 
-def publish_rich_comment_images(
-    comments: list[TikTokComment], video_id: str
-) -> list[TikTokComment]:
-    return publish_rich_comment_media(comments, video_id)
-
-
-def comment_images(comments: list[TikTokComment]) -> list[tuple[int, str]]:
-    images = []
-    for comment_index, comment in enumerate(comments, start=1):
-        for url in comment.get("image_urls") or []:
-            images.append((comment_index, url))
-            if len(images) >= MAX_COMMENT_IMAGES:
-                return images
-    return images
-
-
-def send_comment_media(comments_message_id: int, images: list[tuple[int, str]]) -> list[int]:
-    downloaded = []
-    try:
-        for index, (comment_index, url) in enumerate(images, start=1):
-            downloaded.append((comment_index, download_comment_image(url, index)))
-        reply = json.dumps({"message_id": comments_message_id})
-        if len(downloaded) == 1:
-            comment_index, (filename, content, content_type) = downloaded[0]
-            result = telegram_call(
-                TelegramMethod.SEND_PHOTO,
-                {
-                    **telegram_chat_data(),
-                    "caption": f"Медиа из комментария №{comment_index}",
-                    "reply_parameters": reply,
-                },
-                {"photo": (filename, content, content_type)},
-            )
-            return [int(result["message_id"])]
-
-        files = {}
-        media = []
-        for index, (comment_index, file_info) in enumerate(downloaded):
-            filename, content, content_type = file_info
-            attachment = f"photo{index}"
-            files[attachment] = (filename, content, content_type)
-            media.append(
-                {
-                    "type": "photo",
-                    "media": f"attach://{attachment}",
-                    "caption": f"Комментарий №{comment_index}",
-                }
-            )
-        result = telegram_call(
-            TelegramMethod.SEND_MEDIA_GROUP,
-            {
-                **telegram_chat_data(),
-                "media": json.dumps(media),
-                "reply_parameters": reply,
-            },
-            files,
-        )
-        return [int(message["message_id"]) for message in result]
-    finally:
-        for _, (_, content, _) in downloaded:
-            content.close()
-
-
-def process_comment_media(
-    db: sqlite3.Connection,
+def format_inline_caption(
     video_id: str,
-    comments_message_id: int,
-    comments: list[TikTokComment] | None = None,
-) -> None:
+    comments: list[TikTokComment],
+    media_urls: list[str],
+) -> str:
+    source = f"https://www.tiktok.com/@/video/{video_id}"
+    blocks = [source]
+
+    if comments:
+        blocks.append("")
+        blocks.append("Топ-комментарии:")
+        for index, comment in enumerate(comments, start=1):
+            author = f"@{comment['username']}" if comment.get("username") else "anon"
+            text = (comment.get("text") or "").strip() or "🖼"
+            likes = comment.get("likes") or 0
+            blocks.append(f"{index}. ❤️ {likes} · {author}: {text}")
+
+    if media_urls:
+        blocks.append("")
+        blocks.append("Медиа из комментариев:")
+        for url in media_urls:
+            blocks.append(url)
+
+    caption = "\n".join(blocks)
+    if len(caption) <= MAX_CAPTION_LENGTH:
+        return caption
+    return caption[: MAX_CAPTION_LENGTH - 1].rstrip() + "…"
+
+
+def upload_video_for_file_id(path: Path) -> str:
+    """Uploads a video to the storage chat to obtain a Telegram file_id, then deletes it."""
+    upload_path = path
+    temporary = False
+    if path.stat().st_size > TELEGRAM_UPLOAD_LIMIT:
+        logger.info("Compressing %s for Telegram", path.name)
+        upload_path = compressed_copy(path)
+        temporary = True
+
     try:
-        comments = comments if comments is not None else fetch_top_comments(video_id)
-        images = comment_images(comments)
-        if images:
-            message_ids = send_comment_media(comments_message_id, images)
-            logger.info(
-                "Sent %d comment images for video %s as Telegram messages %s",
-                len(images),
-                video_id,
-                message_ids,
-            )
-            media_status = "sent"
-        else:
-            logger.info("No comment images found for video %s", video_id)
-            media_status = "empty"
-
-        db.execute(
-            """
-            UPDATE liked_videos
-            SET comment_media_status = ?, comment_media_last_error = NULL
-            WHERE video_id = ?
-            """,
-            (media_status, video_id),
-        )
-        db.commit()
-    except Exception as exc:
-        db.execute(
-            """
-            UPDATE liked_videos
-            SET comment_media_status = 'failed',
-                comment_media_attempts = comment_media_attempts + 1,
-                comment_media_last_error = ?
-            WHERE video_id = ?
-            """,
-            (str(exc)[:1000], video_id),
-        )
-        db.commit()
-        logger.exception("Failed to process comment media for video %s", video_id)
-
-
-def process_comments(db: sqlite3.Connection, video_id: str, video_message_id: int) -> None:
-    logger.info("Loading top comments for video %s", video_id)
-    try:
-        comments = fetch_top_comments(video_id)
-        if comments:
+        # Always multipart-upload. Local Bot API raises size limits, but file://
+        # paths only work when the API process can read the host path (not true
+        # for the shared Docker telegram-bot-api on this host).
+        data = {**telegram_chat_data(), "supports_streaming": "true"}
+        with upload_path.open("rb") as video_file:
             result = telegram_call(
-                TelegramMethod.SEND_MESSAGE,
-                {
-                    **telegram_chat_data(),
-                    "text": format_top_comments(comments),
-                    "reply_parameters": json.dumps({"message_id": video_message_id}),
-                },
+                TelegramMethod.SEND_VIDEO,
+                data,
+                {"video": (upload_path.name, video_file, "video/mp4")},
             )
-            logger.info(
-                "Top comments for video %s sent as Telegram message %s",
-                video_id,
-                result["message_id"],
-            )
-            comments_status = "sent"
-            comments_message_id = int(result["message_id"])
-            media_status = "pending" if comment_images(comments) else "empty"
-        else:
-            logger.info("No comments found for video %s", video_id)
-            comments_status = "empty"
-            comments_message_id = None
-            media_status = "empty"
 
-        db.execute(
-            """
-            UPDATE liked_videos
-            SET comments_status = ?,
-                comments_message_id = ?,
-                comments_last_error = NULL,
-                comment_media_status = ?,
-                comment_media_attempts = 0,
-                comment_media_last_error = NULL
-            WHERE video_id = ?
-            """,
-            (comments_status, comments_message_id, media_status, video_id),
-        )
-        db.commit()
-        if comments_message_id and media_status == "pending":
-            process_comment_media(db, video_id, comments_message_id, comments)
-    except Exception as exc:
-        db.execute(
-            """
-            UPDATE liked_videos
-            SET comments_status = 'failed',
-                comments_attempts = comments_attempts + 1,
-                comments_last_error = ?
-            WHERE video_id = ?
-            """,
-            (str(exc)[:1000], video_id),
-        )
-        db.commit()
-        logger.exception("Failed to process comments for video %s", video_id)
+        video = result.get("video") or {}
+        file_id = video.get("file_id")
+        if not file_id:
+            raise RuntimeError("Telegram did not return a video file_id")
+
+        message_id = int(result["message_id"])
+        delete_telegram_message(settings.TELEGRAM_CHAT_ID, message_id)
+        return str(file_id)
+    finally:
+        if temporary:
+            upload_path.unlink(missing_ok=True)
 
 
-def mark_failed(db: sqlite3.Connection, video_id: str, error: Exception) -> None:
-    db.execute(
-        """
-        UPDATE liked_videos
-        SET status = 'failed', attempts = attempts + 1, last_error = ?
-        WHERE video_id = ?
-        """,
-        (str(error)[:1000], video_id),
-    )
-    db.commit()
-
-
-def deliver_tiktok_video(video_id: str, liked_at: int) -> DeliveredTikTokVideo:
+def download_tiktok_video_file(video_id: str, liked_at: int) -> Path:
     validate_download_capacity()
     video = Video(
         id=video_id,
@@ -1566,103 +828,135 @@ def deliver_tiktok_video(video_id: str, liked_at: int) -> DeliveredTikTokVideo:
     path = Path(settings.DOWNLOADS_DIR) / f"{video_id}.mp4"
     if not path.is_file():
         raise RuntimeError(f"Downloaded file not found: {path.name}")
+    validate_upload_capacity(path)
+    return path
+
+
+def prepare_inline_video(db: sqlite3.Connection, video_id: str) -> CachedInlineVideo:
+    cached = get_cached_inline_video(db, video_id)
+    if cached:
+        logger.info("Using cached Telegram file_id for video %s", video_id)
+        return cached
+
+    liked_at = int(time.time())
+    path = download_tiktok_video_file(video_id, liked_at)
     try:
-        validate_upload_capacity(path)
-        video_message_id = send_video(path)
-        logger.info(
-            "Video %s uploaded directly to Telegram as message %s",
-            video_id,
-            video_message_id,
-        )
-        comments_status = DeliveryStatus.EMPTY
-        media_status = DeliveryStatus.EMPTY
+        comments: list[TikTokComment] = []
+        media_urls: list[str] = []
         try:
-            logger.info("Loading top comments for video %s", video_id)
             comments = fetch_top_comments(video_id)
-            original_comment_images = comment_images(comments)
-            rich_comments = publish_rich_comment_images(comments, video_id)
-            embedded_comment_images = False
-            if comments:
-                try:
-                    _, _, embedded_comment_images = send_rich_tiktok_message_with_fallbacks(
-                        video_id,
-                        liked_at,
-                        RichMediaSource(),
-                        rich_comments,
-                        video_message_id,
-                    )
-                except TelegramAPIError:
-                    logger.exception(
-                        "RichMessage failed for video %s, sending plain comments",
-                        video_id,
-                    )
-                    telegram_call(
-                        TelegramMethod.SEND_MESSAGE,
-                        {
-                            **telegram_chat_data(),
-                            "text": format_top_comments(comments),
-                            "reply_parameters": json.dumps({"message_id": video_message_id}),
-                        },
-                    )
-                comments_status = DeliveryStatus.SENT
-            if original_comment_images:
-                media_status = (
-                    DeliveryStatus.SENT if embedded_comment_images else DeliveryStatus.FAILED
-                )
+            media_urls = publish_comment_media_externally(comments)
         except Exception:
-            comments_status = DeliveryStatus.FAILED
-            media_status = DeliveryStatus.FAILED
-            logger.exception("Video %s was sent but comment delivery failed", video_id)
+            logger.exception("Failed to load comments for video %s", video_id)
+
+        file_id = upload_video_for_file_id(path)
+        caption = format_inline_caption(video_id, comments, media_urls)
+        cached = CachedInlineVideo(video_id=video_id, file_id=file_id, caption=caption)
+        store_cached_inline_video(db, cached)
+        logger.info("Prepared inline video %s with file_id cache", video_id)
+        return cached
     finally:
         cleanup_download(path)
-    return DeliveredTikTokVideo(
-        message_id=video_message_id,
-        comments_status=str(comments_status),
-        comment_media_status=str(media_status),
+
+
+def answer_inline_query(
+    inline_query_id: str,
+    results: list[JsonObject],
+    *,
+    cache_time: int | None = None,
+    is_personal: bool = True,
+) -> None:
+    telegram_call(
+        TelegramMethod.ANSWER_INLINE_QUERY,
+        {
+            "inline_query_id": inline_query_id,
+            "results": json.dumps(results, ensure_ascii=False),
+            "cache_time": INLINE_CACHE_TIME_SECONDS if cache_time is None else cache_time,
+            "is_personal": "true" if is_personal else "false",
+        },
     )
 
 
-def process_video(db: sqlite3.Connection, video_id: str, liked_at: int) -> None:
-    logger.info("Processing liked video %s", video_id)
+def article_result(result_id: str, title: str, description: str, message_text: str) -> JsonObject:
+    return {
+        "type": "article",
+        "id": result_id[:INLINE_RESULT_ID_MAX_LENGTH],
+        "title": title,
+        "description": description,
+        "input_message_content": {
+            "message_text": message_text,
+        },
+    }
+
+
+def cached_video_result(cached: CachedInlineVideo) -> JsonObject:
+    result: JsonObject = {
+        "type": "video",
+        "id": f"video-{cached.video_id}"[:INLINE_RESULT_ID_MAX_LENGTH],
+        "video_file_id": cached.file_id,
+        "title": f"TikTok {cached.video_id}",
+        "description": "Отправить видео от своего имени",
+    }
+    if cached.caption:
+        result["caption"] = cached.caption
+    return result
+
+
+def handle_inline_query(db: sqlite3.Connection, query: TelegramInlineQuery) -> None:
+    query_id = str(query.get("id") or "")
+    if not query_id:
+        return
+
+    text = str(query.get("query") or "").strip()
+    if not text:
+        answer_inline_query(
+            query_id,
+            [
+                article_result(
+                    "help",
+                    "Вставьте ссылку на TikTok",
+                    "После загрузки выберите результат — видео уйдёт от вашего имени",
+                    "Отправьте inline-запрос вида:\n@bot https://www.tiktok.com/@user/video/…",
+                )
+            ],
+            cache_time=10,
+        )
+        return
+
+    url = extract_tiktok_url(text)
+    if not url:
+        answer_inline_query(
+            query_id,
+            [
+                article_result(
+                    "invalid-url",
+                    "Не похоже на ссылку TikTok",
+                    "Нужна ссылка вида tiktok.com/@…/video/… или vm.tiktok.com/…",
+                    f"Не удалось распознать ссылку TikTok в запросе:\n{text}",
+                )
+            ],
+            cache_time=5,
+        )
+        return
+
     try:
-        delivery = deliver_tiktok_video(video_id, liked_at)
-        db.execute(
-            """
-            UPDATE liked_videos
-            SET status = 'sent',
-                sent_at = ?,
-                last_error = NULL,
-                video_message_id = ?,
-                comments_status = ?,
-                comments_attempts = 0,
-                comments_last_error = NULL,
-                comments_message_id = NULL,
-                comment_media_status = ?,
-                comment_media_attempts = 0,
-                comment_media_last_error = NULL
-            WHERE video_id = ?
-            """,
-            (
-                datetime.now().isoformat(timespec="seconds"),
-                delivery.message_id,
-                delivery.comments_status,
-                delivery.comment_media_status,
-                video_id,
-            ),
-        )
-        db.commit()
-        logger.info(
-            "Video %s sent as Telegram rich message %s",
-            video_id,
-            delivery.message_id,
-        )
+        video_id = extract_tiktok_video_id(url)
+        cached = prepare_inline_video(db, video_id)
+        answer_inline_query(query_id, [cached_video_result(cached)])
     except Exception as exc:
-        mark_failed(db, video_id, exc)
-        logger.exception("Failed to process video %s", video_id)
-
-
-def configured_chat_matches(chat_id: object) -> bool:
-    return str(chat_id) == str(settings.TELEGRAM_CHAT_ID)
+        logger.exception("Failed to prepare inline TikTok result for query %s", query_id)
+        answer_inline_query(
+            query_id,
+            [
+                article_result(
+                    f"error-{int(time.time())}",
+                    "Не удалось скачать видео",
+                    str(exc)[:120],
+                    f"Не удалось обработать {url}:\n{exc}",
+                )
+            ],
+            cache_time=0,
+        )
 
 
 def initialize_telegram_update_offset(db: sqlite3.Connection) -> int:
@@ -1680,59 +974,27 @@ def initialize_telegram_update_offset(db: sqlite3.Connection) -> int:
     return offset
 
 
-def handle_tiktok_link_message(message: TelegramMessage) -> None:
-    chat = message.get("chat") or {}
-    chat_id = chat.get("id")
-    if not configured_chat_matches(chat_id):
-        return
-
-    text = message.get("text") or message.get("caption")
-    url = extract_single_tiktok_url(text)
-    if not url:
-        return
-
-    message_id = int(message["message_id"])
-    try:
-        video_id = extract_tiktok_video_id(url)
-    except Exception:
-        logger.exception("Failed to parse TikTok link from Telegram message %s", message_id)
-        return
-
-    send_upload_action(chat_id)
-
-    liked_at = int(message.get("date") or time.time())
-    logger.info(
-        "Processing TikTok link from Telegram message %s as video %s",
-        message_id,
-        video_id,
-    )
-    delivery = deliver_tiktok_video(video_id, liked_at)
-    delete_telegram_message(chat_id, message_id)
-    logger.info(
-        "TikTok link video %s sent to Telegram as video message %s",
-        video_id,
-        delivery.message_id,
-    )
-
-
 def process_telegram_updates(db: sqlite3.Connection, timeout: int) -> None:
     offset = initialize_telegram_update_offset(db)
     updates = telegram_get_updates(offset=offset, timeout=timeout)
     for update in updates:
         update_id = int(update["update_id"])
-        message = update.get("message")
-        if isinstance(message, dict):
-            handle_tiktok_link_message(message)
+        inline_query = update.get("inline_query")
+        if isinstance(inline_query, dict):
+            # Telegram uses key "from"; TypedDict may map it differently depending on payload.
+            if "from" in inline_query and "from_user" not in inline_query:
+                inline_query = {**inline_query, "from_user": inline_query["from"]}
+            try:
+                handle_inline_query(db, inline_query)
+            except Exception:
+                logger.exception("Failed to handle inline_query update %s", update_id)
         set_metadata(db, TELEGRAM_UPDATE_OFFSET_KEY, update_id + 1)
 
 
-def run_cycle(db: sqlite3.Connection) -> None:
-    del db
-    cleanup_rich_media()
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Process TikTok links sent to Telegram")
+    parser = argparse.ArgumentParser(
+        description="Inline-only Telegram bot: @bot + TikTok link → video from your name"
+    )
     parser.add_argument("--once", action="store_true", help="Poll Telegram once and exit")
     parser.add_argument(
         "--check-config", action="store_true", help="Validate Telegram and configuration"
@@ -1759,7 +1021,6 @@ def main() -> None:
                 error_backoff_seconds = min(
                     error_backoff_seconds * 2, POLL_ERROR_BACKOFF_MAX_SECONDS
                 )
-            run_cycle(db)
             if args.once:
                 return
 

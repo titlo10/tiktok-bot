@@ -297,6 +297,23 @@ def version_11() -> None:
         f.write("\nCHECK_TIKTOK_AVAILABILITY=true\n")
 
 
+def version_12() -> None:
+    """Убирает локальный хостинг rich-media; бот стал inline-only."""
+    config_dir = get_config_dir()
+    settings_file = config_dir / "settings.conf"
+    remove_prefixes = (
+        "RICH_MEDIA_DIR",
+        "RICH_MEDIA_PUBLIC_BASE_URL",
+        "RICH_MEDIA_TTL_SECONDS",
+    )
+    with open(settings_file, "r+") as f:
+        lines = f.readlines()
+        kept = [line for line in lines if not line.startswith(remove_prefixes)]
+        f.seek(0)
+        f.writelines(kept)
+        f.truncate()
+
+
 VERSIONS = [
     None,
     version_2,
@@ -309,6 +326,7 @@ VERSIONS = [
     version_9,
     version_10,
     version_11,
+    version_12,
 ]
 
 

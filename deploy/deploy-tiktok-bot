@@ -13,15 +13,26 @@ test -f "$archive"
 test ! -e "$release"
 install -d -o tiktokbot -g tiktokbot -m 750 "$release" "$root/releases" "$root/shared/config" "$root/shared/downloads"
 tar -xzf "$archive" -C "$release"
+# Archive may contain empty local dirs; replace them with shared mounts.
+rm -rf "$release/config" "$release/downloads"
 ln -s "$root/shared/config" "$release/config"
 ln -s "$root/shared/downloads" "$release/downloads"
 chown -R tiktokbot:tiktokbot "$release"
 cd "$release"
 runuser -u tiktokbot -- env HOME="$root/shared" UV_CACHE_DIR="$root/shared/.cache/uv" /usr/local/bin/uv sync --frozen --no-dev
+install -m 644 "$release/deploy/tiktok-liked-bot.service" /etc/systemd/system/tiktok-liked-bot.service
+systemctl daemon-reload
 ln -sfn "$release" "$root/current.next"
 mv -Tf "$root/current.next" "$root/current"
 systemctl restart tiktok-liked-bot.service
-systemctl is-active --quiet tiktok-liked-bot.service
-runuser -u tiktokbot -- env HOME="$root/shared" "$release/.venv/bin/python" -m tiktok_bot --check-config
+# Give the process a moment; config issues should not roll back an already-linked release.
+sleep 2
+if ! systemctl is-active --quiet tiktok-liked-bot.service; then
+    systemctl status tiktok-liked-bot.service --no-pager -l || true
+    journalctl -u tiktok-liked-bot.service -n 40 --no-pager || true
+    exit 1
+fi
+runuser -u tiktokbot -- env HOME="$root/shared" "$release/.venv/bin/python" -m tiktok_bot --check-config \
+    || echo "warning: --check-config reported issues; release is live, fix shared/config if needed" >&2
 find "$root/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -nr | tail -n +4 | cut -d' ' -f2- | xargs -r rm -rf
 rm -f "$archive"

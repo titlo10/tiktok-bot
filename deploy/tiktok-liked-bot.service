@@ -1,8 +1,7 @@
 [Unit]
-Description=TikTok link Telegram bot
-Wants=network-online.target nginx.service
-After=network-online.target nginx.service telegram-bot-api.service
-Requires=telegram-bot-api.service
+Description=TikTok inline Telegram bot
+Wants=network-online.target docker.service
+After=network-online.target docker.service
 
 [Service]
 Type=simple
@@ -22,7 +21,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/tiktok-bot/shared /var/www/tiktok-rich
+ReadWritePaths=/opt/tiktok-bot/shared
 
 [Install]
 WantedBy=multi-user.target

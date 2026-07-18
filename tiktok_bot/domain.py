@@ -1,6 +1,5 @@
 from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path
 from typing import Any, TypedDict
 
 
@@ -11,29 +10,12 @@ class TelegramAPIError(RuntimeError):
 
 
 class TelegramMethod(StrEnum):
+    ANSWER_INLINE_QUERY = "answerInlineQuery"
     DELETE_MESSAGE = "deleteMessage"
     GET_CHAT = "getChat"
     GET_ME = "getMe"
     GET_UPDATES = "getUpdates"
-    SEND_CHAT_ACTION = "sendChatAction"
-    SEND_MEDIA_GROUP = "sendMediaGroup"
-    SEND_MESSAGE = "sendMessage"
-    SEND_PHOTO = "sendPhoto"
-    SEND_RICH_MESSAGE = "sendRichMessage"
     SEND_VIDEO = "sendVideo"
-
-
-class DeliveryStatus(StrEnum):
-    EMPTY = "empty"
-    FAILED = "failed"
-    PENDING = "pending"
-    SENT = "sent"
-    SKIPPED = "skipped"
-
-
-class RichCommentMediaKind(StrEnum):
-    ANIMATION = "animation"
-    PHOTO = "photo"
 
 
 class CommentAnimationSourceFormat(StrEnum):
@@ -41,7 +23,18 @@ class CommentAnimationSourceFormat(StrEnum):
     WEBP = "webp"
 
 
+class RichCommentMediaKind(StrEnum):
+    ANIMATION = "animation"
+    PHOTO = "photo"
+
+
 JsonObject = dict[str, Any]
+
+
+class TelegramUser(TypedDict, total=False):
+    id: int
+    username: str
+    first_name: str
 
 
 class TelegramChat(TypedDict, total=False):
@@ -54,9 +47,18 @@ class TelegramMessage(TypedDict, total=False):
     date: int
     message_id: int
     text: str
+    video: JsonObject
+
+
+class TelegramInlineQuery(TypedDict, total=False):
+    from_user: TelegramUser
+    id: str
+    offset: str
+    query: str
 
 
 class TelegramUpdate(TypedDict, total=False):
+    inline_query: TelegramInlineQuery
     message: TelegramMessage
     update_id: int
 
@@ -67,7 +69,6 @@ class TikTokComment(TypedDict, total=False):
     image_url_candidates: list[list[str]]
     image_urls: list[str]
     likes: int
-    rich_media: list["RichCommentMedia"]
     text: str
     username: str
 
@@ -86,26 +87,7 @@ class DownloadedCommentMedia:
 
 
 @dataclass
-class RichMediaSource:
-    video_url: str | None = None
-    audio_url: str | None = None
-    webpage_url: str | None = None
-    description: str | None = None
-    uploader: str | None = None
-    duration: int | None = None
-    view_count: int | None = None
-    like_count: int | None = None
-    comment_count: int | None = None
-
-
-@dataclass
-class PublishedRichMedia:
-    url: str
-    path: Path
-
-
-@dataclass
-class DeliveredTikTokVideo:
-    message_id: int
-    comments_status: str
-    comment_media_status: str
+class CachedInlineVideo:
+    file_id: str
+    video_id: str
+    caption: str

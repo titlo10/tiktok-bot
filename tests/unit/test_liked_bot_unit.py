@@ -1,4 +1,3 @@
-from contextlib import suppress
 from types import SimpleNamespace
 
 import requests
@@ -20,6 +19,14 @@ def test_extract_single_tiktok_url_accepts_only_bare_link() -> None:
     assert liked_bot.extract_single_tiktok_url("look https://www.tiktok.com/@u/video/1") is None
 
 
+def test_extract_tiktok_url_finds_link_inside_inline_query() -> None:
+    assert (
+        liked_bot.extract_tiktok_url("look https://www.tiktok.com/@u/video/1 please")
+        == "https://www.tiktok.com/@u/video/1"
+    )
+    assert liked_bot.extract_tiktok_url("vm.tiktok.com/ZMh123/") == "https://vm.tiktok.com/ZMh123/"
+
+
 def test_extract_tiktok_video_id_from_url_supports_canonical_and_query_urls() -> None:
     assert (
         liked_bot.extract_tiktok_video_id_from_url(
@@ -35,104 +42,117 @@ def test_extract_tiktok_video_id_from_url_supports_canonical_and_query_urls() ->
     )
 
 
-def test_send_video_uses_file_uri_in_local_mode(monkeypatch, tmp_path) -> None:
+def test_upload_video_for_file_id_uses_multipart_and_deletes_storage_message(
+    monkeypatch, tmp_path
+) -> None:
     video = tmp_path / "video.mp4"
     video.write_bytes(b"video")
-    calls: list[tuple[liked_bot.TelegramMethod, liked_bot.JsonObject]] = []
-    monkeypatch.setattr(liked_bot, "TELEGRAM_LOCAL_MODE", True)
-    monkeypatch.setattr(liked_bot, "telegram_chat_data", lambda: {"chat_id": "123"})
-    monkeypatch.setattr(
-        liked_bot,
-        "telegram_call",
-        lambda method, data: calls.append((method, data)) or {"message_id": 99},
-    )
-
-    message_id = liked_bot.send_video(video)
-
-    assert message_id == 99
-    assert calls == [
-        (
-            liked_bot.TelegramMethod.SEND_VIDEO,
-            {
-                "chat_id": "123",
-                "supports_streaming": "true",
-                "video": video.resolve().as_uri(),
-            },
-        )
-    ]
-
-
-def test_handle_tiktok_link_message_delivers_for_configured_chat(monkeypatch) -> None:
     calls: list[tuple] = []
+    monkeypatch.setattr(liked_bot, "telegram_chat_data", lambda: {"chat_id": "123"})
     monkeypatch.setattr(liked_bot.settings, "TELEGRAM_CHAT_ID", "123")
-    monkeypatch.setattr(liked_bot, "extract_tiktok_video_id", lambda _url: "765")
+
+    def fake_call(method, data, files=None):
+        calls.append((method, data, files is not None))
+        if method == liked_bot.TelegramMethod.SEND_VIDEO:
+            assert files is not None
+            assert "video" in files
+            return {"message_id": 99, "video": {"file_id": "file-abc"}}
+        return {}
+
+    monkeypatch.setattr(liked_bot, "telegram_call", fake_call)
+
+    file_id = liked_bot.upload_video_for_file_id(video)
+
+    assert file_id == "file-abc"
+    assert calls[0][0] == liked_bot.TelegramMethod.SEND_VIDEO
+    assert calls[0][1] == {
+        "chat_id": "123",
+        "supports_streaming": "true",
+    }
+    assert calls[0][2] is True
+    assert calls[1][0] == liked_bot.TelegramMethod.DELETE_MESSAGE
+
+
+def test_handle_inline_query_returns_help_when_empty(monkeypatch) -> None:
+    answers: list[tuple] = []
     monkeypatch.setattr(
         liked_bot,
-        "delete_telegram_message",
-        lambda chat_id, message_id: calls.append(("delete", chat_id, message_id)),
+        "answer_inline_query",
+        lambda query_id, results, **kwargs: answers.append((query_id, results, kwargs)),
+    )
+
+    liked_bot.handle_inline_query(object(), {"id": "q1", "query": "  "})
+
+    assert answers[0][0] == "q1"
+    assert answers[0][1][0]["id"] == "help"
+
+
+def test_handle_inline_query_returns_cached_video(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "state.sqlite3"
+    monkeypatch.setattr(liked_bot, "STATE_DB", db_path)
+    db = liked_bot.connect_db()
+    answers: list[list] = []
+    monkeypatch.setattr(
+        liked_bot,
+        "answer_inline_query",
+        lambda _query_id, results, **_kwargs: answers.append(results),
     )
     monkeypatch.setattr(
         liked_bot,
-        "send_upload_action",
-        lambda chat_id: calls.append(("action", chat_id)),
-    )
-    monkeypatch.setattr(
-        liked_bot,
-        "deliver_tiktok_video",
-        lambda video_id, liked_at: calls.append(("deliver", video_id, liked_at))
-        or liked_bot.DeliveredTikTokVideo(
-            message_id=99,
-            comments_status="empty",
-            comment_media_status="empty",
+        "prepare_inline_video",
+        lambda _db, video_id: liked_bot.CachedInlineVideo(
+            video_id=video_id,
+            file_id="file-1",
+            caption="caption",
         ),
     )
 
-    liked_bot.handle_tiktok_link_message(
+    liked_bot.handle_inline_query(
+        db,
         {
-            "message_id": 7,
-            "date": 1783425000,
-            "chat": {"id": "123"},
-            "text": "https://www.tiktok.com/@user/video/765",
-        }
+            "id": "q2",
+            "query": "https://www.tiktok.com/@user/video/7658587349265255694",
+        },
     )
 
-    assert calls == [
-        ("action", "123"),
-        ("deliver", "765", 1783425000),
-        ("delete", "123", 7),
-    ]
+    assert answers[0][0]["type"] == "video"
+    assert answers[0][0]["video_file_id"] == "file-1"
+    assert answers[0][0]["caption"] == "caption"
 
 
-def test_handle_tiktok_link_message_preserves_source_on_failure(monkeypatch) -> None:
-    calls: list[tuple[str, object]] = []
-    monkeypatch.setattr(liked_bot.settings, "TELEGRAM_CHAT_ID", "123")
-    monkeypatch.setattr(liked_bot, "extract_tiktok_video_id", lambda _url: "765")
+def test_process_updates_handles_inline_query(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "state.sqlite3"
+    monkeypatch.setattr(liked_bot, "STATE_DB", db_path)
+    db = liked_bot.connect_db()
+    liked_bot.set_metadata(db, liked_bot.TELEGRAM_UPDATE_OFFSET_KEY, 10)
+    handled: list[dict] = []
     monkeypatch.setattr(
         liked_bot,
-        "delete_telegram_message",
-        lambda chat_id, message_id: calls.append(("delete", (chat_id, message_id))),
-    )
-    monkeypatch.setattr(liked_bot, "send_upload_action", lambda _chat_id: None)
-    monkeypatch.setattr(
-        liked_bot,
-        "deliver_tiktok_video",
-        lambda _video_id, _liked_at: (_ for _ in ()).throw(RuntimeError("failed")),
-    )
-
-    with suppress(RuntimeError):
-        liked_bot.handle_tiktok_link_message(
+        "telegram_get_updates",
+        lambda offset, timeout: [
             {
-                "message_id": 7,
-                "date": 1783425000,
-                "chat": {"id": "123"},
-                "text": "https://www.tiktok.com/@user/video/765",
+                "update_id": 10,
+                "inline_query": {
+                    "id": "iq",
+                    "query": "https://vm.tiktok.com/ZMh/",
+                    "from": {"id": 1},
+                },
             }
-        )
+        ],
+    )
+    monkeypatch.setattr(
+        liked_bot,
+        "handle_inline_query",
+        lambda _db, query: handled.append(query),
+    )
 
-    assert calls == []
+    liked_bot.process_telegram_updates(db, timeout=0)
+
+    assert liked_bot.get_metadata(db, liked_bot.TELEGRAM_UPDATE_OFFSET_KEY) == "11"
+    assert handled[0]["from_user"]["id"] == 1
 
 
-def test_process_updates_commits_offset_after_success(monkeypatch, tmp_path) -> None:
+def test_process_updates_keeps_offset_on_handler_failure(monkeypatch, tmp_path) -> None:
     db_path = tmp_path / "state.sqlite3"
     monkeypatch.setattr(liked_bot, "STATE_DB", db_path)
     db = liked_bot.connect_db()
@@ -140,61 +160,28 @@ def test_process_updates_commits_offset_after_success(monkeypatch, tmp_path) -> 
     monkeypatch.setattr(
         liked_bot,
         "telegram_get_updates",
-        lambda offset, timeout: [{"update_id": 10, "message": {"message_id": 1}}],
+        lambda offset, timeout: [{"update_id": 10, "inline_query": {"id": "iq", "query": "x"}}],
     )
     monkeypatch.setattr(
         liked_bot,
-        "handle_tiktok_link_message",
-        lambda _message: (_ for _ in ()).throw(RuntimeError("failed")),
+        "handle_inline_query",
+        lambda _db, _query: (_ for _ in ()).throw(RuntimeError("failed")),
     )
 
-    with suppress(RuntimeError):
-        liked_bot.process_telegram_updates(db, timeout=0)
+    liked_bot.process_telegram_updates(db, timeout=0)
 
-    assert liked_bot.get_metadata(db, liked_bot.TELEGRAM_UPDATE_OFFSET_KEY) == "10"
-
-
-def test_handle_tiktok_link_message_ignores_other_chats(monkeypatch) -> None:
-    calls = []
-    monkeypatch.setattr(liked_bot.settings, "TELEGRAM_CHAT_ID", "123")
-    monkeypatch.setattr(liked_bot, "deliver_tiktok_video", lambda *_args: calls.append("deliver"))
-
-    liked_bot.handle_tiktok_link_message(
-        {
-            "message_id": 7,
-            "date": 1783425000,
-            "chat": {"id": "456"},
-            "text": "https://www.tiktok.com/@user/video/765",
-        }
-    )
-
-    assert calls == []
+    assert liked_bot.get_metadata(db, liked_bot.TELEGRAM_UPDATE_OFFSET_KEY) == "11"
 
 
-def test_rich_message_contains_only_comment_content(monkeypatch) -> None:
-    calls: list[tuple[str, dict]] = []
-    monkeypatch.setattr(liked_bot, "telegram_chat_data", lambda: {"chat_id": "123"})
-    monkeypatch.setattr(
-        liked_bot,
-        "telegram_call",
-        lambda method, data: calls.append((method, data)) or {"message_id": 99},
-    )
-
-    message_id = liked_bot.send_rich_tiktok_message(
+def test_format_inline_caption_includes_comments_and_media_links() -> None:
+    caption = liked_bot.format_inline_caption(
         "765",
-        0,
-        liked_bot.RichMediaSource(video_url="https://example.test/video.mp4"),
-        [{"username": "alice", "text": "Комментарий", "image_urls": []}],
-        reply_to_message_id=77,
+        [{"username": "alice", "text": "hi", "likes": 3}],
+        ["https://example.test/a.gif"],
     )
-
-    assert message_id == 99
-    method, data = calls[0]
-    html = data["rich_message"]
-    assert method == "sendRichMessage"
-    assert "<video" not in html
-    assert "Комментарий" in html
-    assert data["reply_parameters"] == '{"message_id": 77}'
+    assert "https://www.tiktok.com/@/video/765" in caption
+    assert "@alice" in caption
+    assert "https://example.test/a.gif" in caption
 
 
 def test_classify_comment_media_preserves_supported_formats() -> None:
@@ -334,116 +321,31 @@ def test_fetch_top_comments_keeps_sticker_with_media(monkeypatch) -> None:
     assert comments[0]["image_urls"] == ["https://example.test/sticker.webp"]
 
 
-def test_rich_message_uses_video_tag_for_animation() -> None:
-    html = liked_bot.build_rich_message_html(
-        "765",
-        0,
-        liked_bot.RichMediaSource(),
-        [
-            {
-                "username": "alice",
-                "text": "animation",
-                "rich_media": [
-                    {
-                        "kind": liked_bot.RichCommentMediaKind.ANIMATION,
-                        "url": "https://example.test/sticker.gif",
-                    }
-                ],
-            }
-        ],
-    )
+def test_upload_media_to_external_host(monkeypatch) -> None:
+    response = requests.Response()
+    response.status_code = 200
+    response._content = b"https://litter.catbox.moe/abc.gif"
+    monkeypatch.setattr(liked_bot.requests, "post", lambda *_args, **_kwargs: response)
 
-    assert '<video src="https://example.test/sticker.gif"></video>' in html
-    assert "<img" not in html
+    url = liked_bot.upload_media_to_external_host(b"GIF89a", "x.gif", "image/gif")
+
+    assert url == "https://litter.catbox.moe/abc.gif"
 
 
-def test_publish_rich_media_reuses_identical_content(monkeypatch, tmp_path) -> None:
-    source = b"GIF89a-content"
-    published_path = tmp_path / "comment.gif"
-    published_path.write_bytes(source)
-    classifications: list[bytes] = []
-    original_classifier = liked_bot.classify_comment_media
-    monkeypatch.setattr(liked_bot, "RICH_MEDIA_DIR", tmp_path)
-    monkeypatch.setattr(liked_bot, "RICH_MEDIA_PUBLIC_BASE_URL", "https://example.test")
-    monkeypatch.setattr(
-        liked_bot,
-        "download_comment_media_bytes",
-        lambda _url: (source, "image/gif"),
+def test_prepare_inline_video_uses_cache(monkeypatch, tmp_path) -> None:
+    db_path = tmp_path / "state.sqlite3"
+    monkeypatch.setattr(liked_bot, "STATE_DB", db_path)
+    db = liked_bot.connect_db()
+    liked_bot.store_cached_inline_video(
+        db,
+        liked_bot.CachedInlineVideo(video_id="765", file_id="cached", caption="c"),
     )
     monkeypatch.setattr(
         liked_bot,
-        "classify_comment_media",
-        lambda data, content_type: classifications.append(data)
-        or original_classifier(data, content_type),
-    )
-    monkeypatch.setattr(
-        liked_bot,
-        "publish_rich_bytes",
-        lambda *_args: liked_bot.PublishedRichMedia(
-            url="https://example.test/comment.gif",
-            path=published_path,
-        ),
-    )
-    monkeypatch.setattr(liked_bot, "rich_image_is_publicly_available", lambda _media: True)
-
-    comments = liked_bot.publish_rich_comment_media(
-        [
-            {"image_url_candidates": [["https://one.test/a"]]},
-            {"image_url_candidates": [["https://two.test/b"]]},
-        ],
-        "765",
+        "download_tiktok_video_file",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("should use cache")),
     )
 
-    assert classifications == [source]
-    assert len(comments[0]["rich_media"]) == 1
-    assert comments[1]["rich_media"] == []
-    assert not comments[1].get("image_publish_failed")
+    cached = liked_bot.prepare_inline_video(db, "765")
 
-
-def test_media_limit_does_not_report_publish_failure(monkeypatch, tmp_path) -> None:
-    source = b"GIF89a-content"
-    published_path = tmp_path / "comment.gif"
-    published_path.write_bytes(source)
-    monkeypatch.setattr(liked_bot, "MAX_COMMENT_IMAGES", 1)
-    monkeypatch.setattr(liked_bot, "RICH_MEDIA_DIR", tmp_path)
-    monkeypatch.setattr(liked_bot, "RICH_MEDIA_PUBLIC_BASE_URL", "https://example.test")
-    monkeypatch.setattr(
-        liked_bot,
-        "download_comment_media_bytes",
-        lambda url: (source + url.encode(), "image/gif"),
-    )
-    monkeypatch.setattr(
-        liked_bot,
-        "publish_rich_bytes",
-        lambda *_args: liked_bot.PublishedRichMedia(
-            url="https://example.test/comment.gif",
-            path=published_path,
-        ),
-    )
-    monkeypatch.setattr(liked_bot, "rich_image_is_publicly_available", lambda _media: True)
-
-    comments = liked_bot.publish_rich_comment_media(
-        [
-            {"image_url_candidates": [["https://one.test/a"]]},
-            {"image_url_candidates": [["https://two.test/b"]]},
-        ],
-        "765",
-    )
-
-    assert len(comments[0]["rich_media"]) == 1
-    assert comments[1]["rich_media"] == []
-    assert not comments[1].get("image_publish_failed")
-
-
-def test_run_cycle_does_not_scan_likes(monkeypatch) -> None:
-    monkeypatch.setattr(
-        liked_bot,
-        "scan_likes",
-        lambda _db: (_ for _ in ()).throw(AssertionError("likes must not be scanned")),
-    )
-    calls = []
-    monkeypatch.setattr(liked_bot, "cleanup_rich_media", lambda: calls.append("cleanup"))
-
-    liked_bot.run_cycle(object())
-
-    assert calls == ["cleanup"]
+    assert cached.file_id == "cached"
