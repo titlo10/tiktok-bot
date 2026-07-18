@@ -29,7 +29,6 @@ from tiktok_bot.config import (
     INLINE_CACHE_TIME_SECONDS,
     INLINE_RESULT_ID_MAX_LENGTH,
     KEEP_DOWNLOADS,
-    MAX_CAPTION_LENGTH,
     MAX_COMMENT_IMAGE_BYTES,
     MAX_COMMENT_IMAGES,
     MAX_RICH_TEXT_LENGTH,
@@ -871,10 +870,8 @@ def publish_comment_media_externally(comments: list[TikTokComment]) -> list[str]
 
 
 def format_inline_caption(video_id: str) -> str:
-    caption = f"https://www.tiktok.com/@/video/{video_id}"
-    if len(caption) <= MAX_CAPTION_LENGTH:
-        return caption
-    return caption[: MAX_CAPTION_LENGTH - 1].rstrip() + "…"
+    del video_id
+    return ""
 
 
 def html_text(value: object, limit: int | None = None) -> str:

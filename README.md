@@ -15,7 +15,8 @@
 3. В чате: `@your_bot https://www.tiktok.com/@user/video/…`
 4. Выберите результат — видео от вас; следом reply от бота с комментариями.
 
-В caption к видео — только ссылка на TikTok (по ней бот узнаёт `video_id`).
+Под видео caption пустой. Для RichMessage бот находит `video_id` по `file_id`
+из кэша после inline-отправки.
 
 ## RichMessage и медиа
 

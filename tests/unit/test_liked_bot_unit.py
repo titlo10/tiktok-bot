@@ -173,9 +173,8 @@ def test_process_updates_keeps_offset_on_handler_failure(monkeypatch, tmp_path) 
     assert liked_bot.get_metadata(db, liked_bot.TELEGRAM_UPDATE_OFFSET_KEY) == "11"
 
 
-def test_format_inline_caption_is_source_link_only() -> None:
-    caption = liked_bot.format_inline_caption("765")
-    assert caption == "https://www.tiktok.com/@/video/765"
+def test_format_inline_caption_is_empty() -> None:
+    assert liked_bot.format_inline_caption("765") == ""
 
 
 def test_build_rich_message_html_embeds_images_and_animations() -> None:
@@ -225,13 +224,16 @@ def test_handle_via_bot_message_sends_rich_reply(monkeypatch, tmp_path) -> None:
         lambda chat_id, reply_to, comments: calls.append((chat_id, reply_to, comments)) or 55,
     )
 
+    liked_bot.store_cached_inline_video(
+        db,
+        liked_bot.CachedInlineVideo(video_id="7658587349265255694", file_id="f1", caption=""),
+    )
     liked_bot.handle_via_bot_message(
         db,
         {
             "message_id": 7,
             "chat": {"id": -100},
             "via_bot": {"id": 42, "username": "witchcult_bot"},
-            "caption": "https://www.tiktok.com/@u/video/7658587349265255694",
             "video": {"file_id": "f1"},
         },
     )
